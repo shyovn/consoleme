@@ -9,7 +9,6 @@ from pydantic import ValidationError
 
 from consoleme.models import (
     Action,
-    Action1,
     AssumeRolePolicyChangeModel,
     ChangeModelArray,
     Command,
@@ -17,6 +16,7 @@ from consoleme.models import (
     ExtendedRoleModel,
     InlinePolicyChangeModel,
     ManagedPolicyChangeModel,
+    PermissionsBoundaryChangeModel,
     PolicyRequestModificationRequestModel,
     PolicyRequestModificationResponseModel,
     RequestCreationResponse,
@@ -52,7 +52,10 @@ existing_policy_document = {
 
 async def get_extended_request_helper():
     inline_policy_change = {
-        "principal_arn": "arn:aws:iam::123456789012:role/test",
+        "principal": {
+            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal_type": "AwsResource",
+        },
         "change_type": "inline_policy",
         "resources": [],
         "version": 2.0,
@@ -72,7 +75,10 @@ async def get_extended_request_helper():
 
     extended_request = ExtendedRequestModel(
         id="1234",
-        arn="arn:aws:iam::123456789012:role/test",
+        principal=dict(
+            principal_type="AwsResource",
+            principal_arn="arn:aws:iam::123456789012:role/test",
+        ),
         timestamp=int(time.time()),
         justification="Test justification",
         requester_email="user@example.com",
@@ -114,7 +120,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         )
 
         inline_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "inline_policy",
             "resources": [],
             "version": 2.0,
@@ -261,7 +270,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
             tags=[],
         )
         managed_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+                "principal_type": "AwsResource",
+            },
             "change_type": "managed_policy",
             "policy_name": "invalid<html>characters",
             "resources": [],
@@ -281,7 +293,7 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Invalid characters were detected in the policy.", str(e))
 
         # Trying to detach a policy that is not attached
-        managed_policy_change_model.action = Action1.detach
+        managed_policy_change_model.action = Action.detach
         with pytest.raises(InvalidRequestParameter) as e:
             await validate_managed_policy_change(
                 managed_policy_change_model, "user@example.com", role
@@ -293,7 +305,7 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         # Trying to attach a policy that is already attached
         role.managed_policies = [{"PolicyArn": managed_policy_change_model.arn}]
-        managed_policy_change_model.action = Action1.attach
+        managed_policy_change_model.action = Action.attach
         with pytest.raises(InvalidRequestParameter) as e:
             await validate_managed_policy_change(
                 managed_policy_change_model, "user@example.com", role
@@ -309,16 +321,85 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         managed_policy_change_model.arn = (
             "arn:aws:iam::123456789012:policy/TestManagedPolicy2"
         )
-        managed_policy_change_model.action = Action1.attach
+        managed_policy_change_model.action = Action.attach
         await validate_managed_policy_change(
             managed_policy_change_model, "user@example.com", role
         )
 
         # Detach a managed policy that is attached to the role
         role.managed_policies = [{"PolicyArn": managed_policy_change_model.arn}]
-        managed_policy_change_model.action = Action1.detach
+        managed_policy_change_model.action = Action.detach
         await validate_managed_policy_change(
             managed_policy_change_model, "user@example.com", role
+        )
+
+    async def test_validate_permissions_boundary_change(self):
+        from consoleme.exceptions.exceptions import InvalidRequestParameter
+        from consoleme.lib.v2.requests import validate_permissions_boundary_change
+
+        role = ExtendedRoleModel(
+            name="role_name",
+            account_id="123456789012",
+            account_name="friendly_name",
+            arn="arn:aws:iam::123456789012:role/role_name",
+            inline_policies=[],
+            assume_role_policy_document={},
+            managed_policies=[],
+            permissions_boundary={},
+            tags=[],
+        )
+        permissions_boundary_change = {
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+                "principal_type": "AwsResource",
+            },
+            "change_type": "permissions_boundary",
+            "policy_name": "invalid<html>characters",
+            "resources": [],
+            "status": "not_applied",
+            "action": "detach",
+            "arn": "arn:aws:iam::123456789012:policy/TestManagedPolicy",
+        }
+        permissions_boundary_change_model = PermissionsBoundaryChangeModel.parse_obj(
+            permissions_boundary_change
+        )
+
+        # Trying to update an managed policy with invalid characters
+        with pytest.raises(InvalidRequestParameter) as e:
+            await validate_permissions_boundary_change(
+                permissions_boundary_change_model, "user@example.com", role
+            )
+            self.assertIn("Invalid characters were detected in the policy.", str(e))
+
+        # Trying to detach a policy that is not attached
+        permissions_boundary_change_model.action = Action.detach
+        with pytest.raises(InvalidRequestParameter) as e:
+            await validate_permissions_boundary_change(
+                permissions_boundary_change_model, "user@example.com", role
+            )
+            self.assertIn(
+                f"{permissions_boundary_change_model.arn}  is not attached to this role as a permissions boundary",
+                str(e),
+            )
+
+        # Valid tests
+
+        # Attach a managed policy that is not attached
+        permissions_boundary_change_model.arn = (
+            "arn:aws:iam::123456789012:policy/TestManagedPolicy2"
+        )
+        permissions_boundary_change_model.action = Action.attach
+        await validate_permissions_boundary_change(
+            permissions_boundary_change_model, "user@example.com", role
+        )
+
+        # Detach a managed policy that is attached to the role
+        role.permissions_boundary = {
+            "PermissionsBoundaryArn": permissions_boundary_change_model.arn
+        }
+        permissions_boundary_change_model.action = Action.detach
+        await validate_permissions_boundary_change(
+            permissions_boundary_change_model, "user@example.com", role
         )
 
     async def test_validate_assume_role_policy_change(self):
@@ -336,7 +417,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
             tags=[],
         )
         assume_role_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+                "principal_type": "AwsResource",
+            },
             "change_type": "assume_role_policy",
             "resources": [],
             "status": "not_applied",
@@ -407,7 +491,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         )
 
         inline_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "inline_policy",
             "resources": [
                 {
@@ -510,7 +597,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         )
 
         managed_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+                "principal_type": "AwsResource",
+            },
             "change_type": "managed_policy",
             "policy_name": "invalid<html>characters",
             "resources": [],
@@ -527,7 +617,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         }
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -604,7 +697,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_changes_to_role
 
         inline_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "inline_policy",
             "resources": [],
             "version": 2.0,
@@ -647,7 +743,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -754,7 +853,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_changes_to_role
 
         managed_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+                "principal_type": "AwsResource",
+            },
             "change_type": "managed_policy",
             "policy_name": "TestManagedPolicy",
             "resources": [],
@@ -768,7 +870,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -802,7 +907,7 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         # Trying to attach a managed policy that doesn't exist
         response.action_results = []
         response.errors = 0
-        managed_policy_change_model.action = Action1.attach
+        managed_policy_change_model.action = Action.attach
         extended_request.changes = ChangeModelArray(
             changes=[managed_policy_change_model]
         )
@@ -845,7 +950,7 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         # Detaching the managed policy -> no errors
         response.action_results = []
         response.errors = 0
-        managed_policy_change_model.action = Action1.detach
+        managed_policy_change_model.action = Action.detach
         extended_request.changes = ChangeModelArray(
             changes=[managed_policy_change_model]
         )
@@ -861,7 +966,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_changes_to_role
 
         assume_role_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+                "principal_type": "AwsResource",
+            },
             "change_type": "assume_role_policy",
             "resources": [],
             "status": "not_applied",
@@ -891,7 +999,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -928,7 +1039,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_changes_to_role
 
         resource_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "resource_policy",
             "resources": [
                 {
@@ -953,7 +1067,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -983,7 +1100,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_changes_to_role
 
         assume_role_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/role_name",
+                "principal_type": "AwsResource",
+            },
             "change_type": "assume_role_policy",
             "resources": [],
             "status": "not_applied",
@@ -1014,7 +1134,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -1107,7 +1230,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         )
 
         inline_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "inline_policy",
             "resources": [],
             "version": 2.0,
@@ -1128,7 +1254,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -1184,7 +1313,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_resource_policy_change
 
         resource_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "resource_policy",
             "id": "1234",
             "source_change_id": "5678",
@@ -1211,7 +1343,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -1242,7 +1377,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_resource_policy_change
 
         resource_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "sts_resource_policy",
             "id": "1234",
             "source_change_id": "5678",
@@ -1281,7 +1419,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -1335,7 +1476,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_resource_policy_change
 
         resource_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "resource_policy",
             "id": "1234",
             "source_change_id": "5678",
@@ -1382,7 +1526,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -1431,7 +1578,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_resource_policy_change
 
         resource_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "resource_policy",
             "id": "1234",
             "source_change_id": "5678",
@@ -1469,7 +1619,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -1523,7 +1676,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
         from consoleme.lib.v2.requests import apply_resource_policy_change
 
         resource_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "resource_policy",
             "id": "1234",
             "source_change_id": "5678",
@@ -1561,7 +1717,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = ExtendedRequestModel(
             id="1234",
-            arn="arn:aws:iam::123456789012:role/test",
+            principal=dict(
+                principal_type="AwsResource",
+                principal_arn="arn:aws:iam::123456789012:role/test",
+            ),
             timestamp=int(time.time()),
             justification="Test justification",
             requester_email="user@example.com",
@@ -2053,7 +2212,10 @@ class TestRequestsLibV2(unittest.IsolatedAsyncioTestCase):
 
         extended_request = await get_extended_request_helper()
         resource_policy_change = {
-            "principal_arn": "arn:aws:iam::123456789012:role/test",
+            "principal": {
+                "principal_arn": "arn:aws:iam::123456789012:role/test",
+                "principal_type": "AwsResource",
+            },
             "change_type": "resource_policy",
             "resources": [
                 {

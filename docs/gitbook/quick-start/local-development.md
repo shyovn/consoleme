@@ -4,7 +4,7 @@ description: Provides instructions for getting ConsoleMe up and running locally.
 
 # Local
 
-ConsoleMe requires Python 3.8 or above. Install [**git**](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git), [**docker**](https://docs.docker.com/get-docker/), and [**docker-compose**](https://docs.docker.com/compose/install/) _\*\*_on your system, consider following [Docker's post-installation steps for Linux](https://docs.docker.com/engine/install/linux-postinstall/), then clone ConsoleMe locally in a directory of your choosing via HTTP or SSH:
+ConsoleMe requires Python 3.8 or above. Install [**git**](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git), [**docker**](https://docs.docker.com/get-docker/), and [**docker-compose**](https://docs.docker.com/compose/install/) \_\*\*\_on your system, consider following [Docker's post-installation steps for Linux](https://docs.docker.com/engine/install/linux-postinstall/), then clone ConsoleMe locally in a directory of your choosing via HTTP or SSH:
 
 ## MacOS
 
@@ -42,7 +42,7 @@ git clone git@github.com:Netflix/consoleme.git ; cd consoleme
 
 **Start Redis and DynamoDB containers**
 
-A local set of Redis and DynamoDB \(local\) instances need to be set up. These are provided as Docker containers. In a separate terminal window, start the local redis and dynamodb instances:
+A local set of Redis and DynamoDB \(local\) instances need to be set up. These are provided as Docker containers. In a separate terminal window, start the local Redis and dynamodb instances:
 
 ```text
 docker-compose -f docker-compose-dependencies.yaml up -d
@@ -103,7 +103,7 @@ You'll notice that you're unable to access any IAM roles with the default config
 
 ## Create your Configuration
 
-At this point, you'll want to configure ConsoleMe to suit your needs. Read up on [ConsoleMe’s yaml configuration.](../configuration/) ConsoleMe can be configured to [authenticate your users via SAML, OIDC, header authentication, or it can bypass authentication altogether](../configuration/authentication-and-authorization/).
+At this point, you'll want to configure ConsoleMe to suit your needs. Read up on [ConsoleMe’s yaml configuration.](../configuration/) ConsoleMe can be configured to [authenticate your users via SAML, OIDC, header authentication, or it can bypass authentication altogether](../configuration/authentication-and-authorization/). We have a script that can help you generate your ConsoleMe configuration. Read more about that in our [Configuration FAQ](../configuration/#configuring-consoleme-is-complicated-is-there-something-that-can-help-me-generate-a-configuration).
 
-To get started, copy [this configuration](https://gist.github.com/castrapel/888cd106d12523a5445bf6f3cf9c810b). Read through the configuration and change the values to suit your environment. Then, set the `CONFIG_LOCATION` environment variable to the full path of your configuration file, or copy the configuration to one of the locations ConsoleMe will load from \(described [here](https://app.gitbook.com/@hawkins/s/consoleme/~/drafts/-MUCSXyHqSfyDOwV-0Mc/configuration)\).
+Then, set the `CONFIG_LOCATION` environment variable to the full path of your configuration file, or copy the configuration to one of the locations ConsoleMe will load from \(described [here](../configuration/#how-does-consoleme-determine-its-configuration)\).
 

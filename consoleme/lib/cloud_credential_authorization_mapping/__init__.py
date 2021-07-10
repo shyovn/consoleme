@@ -1,6 +1,7 @@
 import sys
 import time
-from typing import Dict
+from collections import defaultdict
+from typing import Dict, List, Optional
 
 import sentry_sdk
 from pydantic.json import pydantic_encoder
@@ -31,11 +32,26 @@ log = config.get_logger("consoleme")
 
 class CredentialAuthorizationMapping(metaclass=Singleton):
     def __init__(self) -> None:
+        self._all_roles = []
         self.authorization_mapping = {}
-        self.last_update = 0
+        self.authorization_mapping_last_update = 0
+        self.reverse_mapping = {}
+        self.reverse_mapping_last_update = 0
 
-    async def retrieve_credential_authorization_mapping(self):
-        if not self.authorization_mapping or int(time.time()) - self.last_update > 60:
+    async def retrieve_credential_authorization_mapping(
+        self, max_age: Optional[int] = None
+    ):
+        """
+        This function retrieves the credential authorization mapping. This is a mapping of users/groups to the IAM roles
+        they are allowed to get credentials for. This is the authoritative mapping that ConsoleMe uses for access.
+
+        :param max_age: Maximum allowable age of the credential authorization mapping. If the mapping is older than
+        `max_age` seconds, this function will raise an exception and return an empty mapping.
+        """
+        if (
+            not self.authorization_mapping
+            or int(time.time()) - self.authorization_mapping_last_update > 60
+        ):
             redis_topic = config.get(
                 "generate_and_store_credential_authorization_mapping.redis_key",
                 "CREDENTIAL_AUTHORIZATION_MAPPING_V1",
@@ -44,7 +60,8 @@ class CredentialAuthorizationMapping(metaclass=Singleton):
                 "generate_and_store_credential_authorization_mapping.s3.bucket"
             )
             s3_key = config.get(
-                "generate_and_store_credential_authorization_mapping.s3.file"
+                "generate_and_store_credential_authorization_mapping.s3.file",
+                "credential_authorization_mapping/credential_authorization_mapping_v1.json.gz",
             )
             try:
                 self.authorization_mapping = await retrieve_json_data_from_redis_or_s3(
@@ -53,8 +70,9 @@ class CredentialAuthorizationMapping(metaclass=Singleton):
                     s3_key=s3_key,
                     json_object_hook=RoleAuthorizationsDecoder,
                     json_encoder=pydantic_encoder,
+                    max_age=max_age,
                 )
-                self.last_update = int(time.time())
+                self.authorization_mapping_last_update = int(time.time())
             except Exception as e:
                 sentry_sdk.capture_exception()
                 log.error(
@@ -66,6 +84,66 @@ class CredentialAuthorizationMapping(metaclass=Singleton):
                 )
                 return {}
         return self.authorization_mapping
+
+    async def retrieve_reverse_authorization_mapping(
+        self, max_age: Optional[int] = None
+    ):
+        """
+        This function retrieves the inverse of the credential authorization mapping. This is a mapping of IAM roles
+        to the users/groups that are allowed to access them. This mapping is used primarily for auditing.
+
+        :param max_age: Maximum allowable age of the reverse credential authorization mapping. If the mapping is older
+        than `max_age` seconds, this function will raise an exception and return an empty mapping.
+        """
+        if (
+            not self.reverse_mapping
+            or int(time.time()) - self.reverse_mapping_last_update > 60
+        ):
+            redis_topic = config.get(
+                "generate_and_store_reverse_authorization_mapping.redis_key",
+                "REVERSE_AUTHORIZATION_MAPPING_V1",
+            )
+            s3_bucket = config.get(
+                "generate_and_store_reverse_authorization_mapping.s3.bucket"
+            )
+            s3_key = config.get(
+                "generate_and_store_reverse_authorization_mapping.s3.file",
+                "reverse_authorization_mapping/reverse_authorization_mapping_v1.json.gz",
+            )
+            try:
+                self.reverse_mapping = await retrieve_json_data_from_redis_or_s3(
+                    redis_topic,
+                    s3_bucket=s3_bucket,
+                    s3_key=s3_key,
+                    json_object_hook=RoleAuthorizationsDecoder,
+                    json_encoder=pydantic_encoder,
+                    max_age=max_age,
+                )
+                self.reverse_mapping_last_update = int(time.time())
+            except Exception as e:
+                sentry_sdk.capture_exception()
+                log.error(
+                    {
+                        "function": f"{self.__class__.__name__}.{sys._getframe().f_code.co_name}",
+                        "error": f"Error loading reverse credential mapping. Returning empty mapping: {e}",
+                    },
+                    exc_info=True,
+                )
+                return {}
+        return self.reverse_mapping
+
+    async def all_roles(self):
+        if self._all_roles:
+            return self._all_roles
+        reverse_mapping = await self.retrieve_reverse_authorization_mapping()
+        self._all_roles = list(reverse_mapping.keys())
+        return self._all_roles
+
+    async def determine_role_authorized_groups(self, account_id: str, role_name: str):
+        arn = f"arn:aws:iam::{account_id}:role/{role_name.lower()}"
+        reverse_mapping = await self.retrieve_reverse_authorization_mapping()
+        groups = reverse_mapping.get(arn, [])
+        return set(groups)
 
     async def determine_users_authorized_roles(self, user, groups, include_cli=False):
         authorization_mapping = await self.retrieve_credential_authorization_mapping()
@@ -82,6 +160,43 @@ class CredentialAuthorizationMapping(metaclass=Singleton):
                 if include_cli:
                     authorized_roles.update(group_mapping.authorized_roles_cli_only)
         return sorted(authorized_roles)
+
+
+async def generate_and_store_reverse_authorization_mapping(
+    authorization_mapping: Dict[user_or_group, RoleAuthorizations]
+) -> Dict[str, List[user_or_group]]:
+    reverse_mapping = defaultdict(list)
+    for identity, roles in authorization_mapping.items():
+        for role in roles.authorized_roles:
+            reverse_mapping[role.lower()].append(identity)
+        for role in roles.authorized_roles_cli_only:
+            reverse_mapping[role.lower()].append(identity)
+
+    # Store in S3 and Redis
+    redis_topic = config.get(
+        "generate_and_store_reverse_authorization_mapping.redis_key",
+        "REVERSE_AUTHORIZATION_MAPPING_V1",
+    )
+    s3_bucket = None
+    s3_key = None
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev", "test"]:
+        s3_bucket = config.get(
+            "generate_and_store_reverse_authorization_mapping.s3.bucket"
+        )
+        s3_key = config.get(
+            "generate_and_store_reverse_authorization_mapping.s3.file",
+            "reverse_authorization_mapping/reverse_authorization_mapping_v1.json.gz",
+        )
+    await store_json_results_in_redis_and_s3(
+        reverse_mapping,
+        redis_topic,
+        s3_bucket=s3_bucket,
+        s3_key=s3_key,
+        json_encoder=pydantic_encoder,
+    )
+    return reverse_mapping
 
 
 async def generate_and_store_credential_authorization_mapping() -> Dict[
@@ -120,7 +235,8 @@ async def generate_and_store_credential_authorization_mapping() -> Dict[
             "generate_and_store_credential_authorization_mapping.s3.bucket"
         )
         s3_key = config.get(
-            "generate_and_store_credential_authorization_mapping.s3.file"
+            "generate_and_store_credential_authorization_mapping.s3.file",
+            "credential_authorization_mapping/credential_authorization_mapping_v1.json.gz",
         )
     await store_json_results_in_redis_and_s3(
         authorization_mapping,

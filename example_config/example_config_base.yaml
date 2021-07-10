@@ -1,3 +1,7 @@
+# Warning: The following configuration file is an example, and it is insecure by default. Please carefully
+# review and change values accordingly before deploying to a production environment. You are responsible
+# for your deployment.
+
 # Enter your team's e-mail address here. This e-mail will be used as the default approvers of IAM policy requests
 application_admin: consoleme_admins@example.com
 
@@ -23,13 +27,21 @@ tornado:
 #  "123456789013": prod
 #  "123456789014": test
 
+# ConsoleMe can cache account, org structure, and SCPs from AWS Organizations in one or more accounts
 #cache_accounts_from_aws_organizations:
 #  # This is the account ID of your AWS organizations master
-#  organizations_master_account_id: "123456789012"
-#  # This is the name of the role that consoleme will attempt to assume on your Organizations master account to retrieve
-#  # account information. Ensure that ConsoleMe can assume this role, and that this role has the permission:
-#  # organizations:listaccounts
-#  organizations_master_role_to_assume: "ConsoleMe"
+#  - organizations_master_account_id: "123456789012"
+#    # This is the name of the role that consoleme will attempt to assume on your Organizations master account to retrieve
+#    # account information. Ensure that ConsoleMe can assume this role, and that this role has the permissions:
+#    # organizations:DescribeAccount
+#    # organizations:DescribeOrganizationalUnit
+#    # organizations:DescribePolicy
+#    # organizations:ListAccounts
+#    # organizations:ListChildren
+#    # organizations:ListPolicies
+#    # organizations:ListRoots
+#    # organizations:ListTargetsForPolicy
+#    organizations_master_role_to_assume: "ConsoleMe"
 
 #retrieve_accounts_from_swag:
 #  base_url: 'https://your_swag_url/'
@@ -55,6 +67,7 @@ cloud_credential_authorization_mapping:
 
 aws:
   issuer: YourCompany
+  region: "us-east-1"
 
 celery:
   # Some jobs should only run in one region. The `active_region` key should define your primary region.
@@ -155,6 +168,7 @@ logging_levels:
 ses:
   support_reference: "Please contact us at consoleme@example.com if you have any questions or concerns."
   arn: "arn:aws:ses:us-east-1:123456789012:identity/example.com"
+  region: "us-west-2"
   consoleme:
     name: ConsoleMe
     sender: consoleme_test@example.com
@@ -162,3 +176,12 @@ ses:
 # Challenge URL authentication is used to authenticate users from CLI clients (like Weep).
 challenge_url:
   enabled: true
+
+# If you have read this far and modified the above config variables to production ready values
+# remove the below config variable, or switch it to false
+example_config:
+  is_example_config: true
+  title: "Warning:"
+  text: |-
+    This configuration has no authentication configured. Do not use in a production environment. Do not publicly expose this endpoint or your AWS environment will be compromised! Click [here](/generate_config) to generate a configuration.
+  routes: .*

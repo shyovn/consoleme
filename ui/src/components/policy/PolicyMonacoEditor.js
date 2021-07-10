@@ -3,6 +3,7 @@ import { Button, Form, Icon, Message, Segment } from "semantic-ui-react";
 import MonacoEditor from "react-monaco-editor";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api.js";
 import {
+  getLocalStorageSettings,
   getMonacoCompletions,
   getMonacoTriggerCharacters,
 } from "../../helpers/utils";
@@ -105,6 +106,7 @@ export const PolicyMonacoEditor = ({
   const { user, sendRequestCommon } = useAuth();
   const { setModalWithAdminAutoApprove } = usePolicyContext();
   const editorRef = useRef();
+  const editorTheme = getLocalStorageSettings("editorTheme");
   const timeout = useRef(null);
 
   const policyDocumentOriginal = JSON.stringify(
@@ -206,7 +208,7 @@ export const PolicyMonacoEditor = ({
           ref={editorRef}
           height="540px"
           language="json"
-          theme="vs-dark"
+          theme={editorTheme}
           value={policyDocument}
           onChange={onEditChange}
           options={editorOptions}
@@ -266,6 +268,7 @@ export const NewPolicyMonacoEditor = ({ addPolicy, setIsNewPolicy }) => {
   const { user, sendRequestCommon } = useAuth();
   const { setModalWithAdminAutoApprove } = usePolicyContext();
   const editorRef = useRef();
+  const editorTheme = getLocalStorageSettings("editorTheme");
   const timeout = useRef(null);
 
   const [newPolicyName, setNewPolicyName] = useState("");
@@ -405,7 +408,7 @@ export const NewPolicyMonacoEditor = ({ addPolicy, setIsNewPolicy }) => {
           ref={editorRef}
           height="540px"
           language="json"
-          theme="vs-dark"
+          theme={editorTheme}
           value={policyDocument}
           onChange={onEditChange}
           options={editorOptions}
@@ -441,6 +444,35 @@ export const NewPolicyMonacoEditor = ({ addPolicy, setIsNewPolicy }) => {
           onClick={() => setIsNewPolicy(false)}
         />
       </Button.Group>
+    </>
+  );
+};
+
+export const ReadOnlyPolicyMonacoEditor = ({ policy }) => {
+  const readOnlyEditorOptions = {
+    ...editorOptions,
+    readOnly: true,
+  };
+  const editorTheme = getLocalStorageSettings("editorTheme");
+  return (
+    <>
+      <Segment
+        attached
+        style={{
+          border: 0,
+          padding: 0,
+        }}
+      >
+        <MonacoEditor
+          height="540px"
+          language="json"
+          theme={editorTheme}
+          value={JSON.stringify(policy, null, "\t")}
+          options={readOnlyEditorOptions}
+          editorDidMount={editorDidMount}
+          textAlign="center"
+        />
+      </Segment>
     </>
   );
 };

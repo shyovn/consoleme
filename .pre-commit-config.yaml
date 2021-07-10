@@ -7,6 +7,7 @@ repos:
       - id: check-ast
       - id: check-case-conflict
       - id: check-yaml
+        exclude: "cdk/resources/create_config_lambda/config.yaml"
   - repo: https://gitlab.com/pycqa/flake8
     rev: 3.8.4
     hooks:
@@ -56,6 +57,11 @@ repos:
             "-c",
             "./ui/.eslintrc",
           ]
+  - repo: https://github.com/gruntwork-io/pre-commit
+    rev: v0.1.12
+    hooks:
+      - id: terraform-fmt
+      - id: terraform-validate
   - repo: local
     hooks:
       - id: pytest

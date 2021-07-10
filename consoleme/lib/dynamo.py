@@ -1,8 +1,10 @@
 import asyncio
+import os
 import sys
 import time
 import uuid
 import zlib
+from collections import defaultdict
 from datetime import datetime
 
 # used as a placeholder for empty SID to work around this:
@@ -15,7 +17,8 @@ import boto3
 import sentry_sdk
 import simplejson as json
 import yaml
-from asgiref.sync import async_to_sync, sync_to_async
+from asgiref.sync import sync_to_async
+from boto3.dynamodb.conditions import Key
 from boto3.dynamodb.types import Binary  # noqa
 from cloudaux import get_iso_string
 from cloudaux.aws.sts import boto3_cached_conn
@@ -140,9 +143,9 @@ class BaseDynamoHandler:
             if str(obj) == "":
                 obj = DYNAMO_EMPTY_STRING
             elif type(obj) in [float, int]:
-                obj = Decimal(obj)
+                obj = Decimal(str(obj))
             elif isinstance(obj, datetime):
-                obj = Decimal(obj.timestamp())
+                obj = Decimal(str(obj.timestamp()))
             return obj
 
     def parallel_write_table(self, table, data, overwrite_by_pkeys=None):
@@ -154,9 +157,20 @@ class BaseDynamoHandler:
                     with attempt:
                         batch.put_item(Item=self._data_to_dynamo_replace(item))
 
-    def parallel_scan_table(self, table, total_threads=10, loop=None):
+    def parallel_scan_table(
+        self,
+        table,
+        total_threads=os.cpu_count(),
+        loop=None,
+        dynamodb_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if not dynamodb_kwargs:
+            dynamodb_kwargs = {}
+
         async def _scan_segment(segment, total_segments):
-            response = table.scan(Segment=segment, TotalSegments=total_segments)
+            response = table.scan(
+                Segment=segment, TotalSegments=total_segments, **dynamodb_kwargs
+            )
             items = response.get("Items", [])
 
             while "LastEvaluatedKey" in response:
@@ -164,6 +178,7 @@ class BaseDynamoHandler:
                     ExclusiveStartKey=response["LastEvaluatedKey"],
                     Segment=segment,
                     TotalSegments=total_segments,
+                    **dynamodb_kwargs,
                 )
                 items.extend(self._data_from_dynamo_replace(response["Items"]))
 
@@ -214,6 +229,10 @@ class UserDynamoHandler(BaseDynamoHandler):
                     "aws.resource_cache_dynamo_table", "consoleme_resource_cache"
                 )
             )
+            self.cloudtrail_table = self._get_dynamo_table(
+                config.get("aws.cloudtrail_table", "consoleme_cloudtrail")
+            )
+
             if user_email:
                 self.user = self.get_or_create_user(user_email)
                 self.affected_user = self.user
@@ -260,7 +279,7 @@ class UserDynamoHandler(BaseDynamoHandler):
 
     def get_dynamic_config_dict(self) -> dict:
         """Retrieve dynamic configuration dictionary that can be merged with primary configuration dictionary."""
-        current_config_yaml = async_to_sync(self.get_dynamic_config_yaml)()
+        current_config_yaml = asyncio.run(self.get_dynamic_config_yaml())
         config_d = yaml.safe_load(current_config_yaml)
         return config_d
 
@@ -438,7 +457,7 @@ class UserDynamoHandler(BaseDynamoHandler):
         """
         new_request = {
             "request_id": extended_request.id,
-            "arn": extended_request.arn,
+            "principal": extended_request.principal.dict(),
             "status": extended_request.request_status.value,
             "justification": extended_request.justification,
             "request_time": extended_request.timestamp,
@@ -447,12 +466,23 @@ class UserDynamoHandler(BaseDynamoHandler):
             "extended_request": json.loads(extended_request.json()),
             "username": extended_request.requester_email,
         }
+
+        if extended_request.principal.principal_type == "AwsResource":
+            new_request["arn"] = extended_request.principal.principal_arn
+        elif extended_request.principal.principal_type == "HoneybeeAwsResourceTemplate":
+            repository_name = extended_request.principal.repository_name
+            resource_identifier = extended_request.principal.resource_identifier
+            new_request["arn"] = f"{repository_name}-{resource_identifier}"
+        else:
+            raise Exception("Invalid principal type")
+
         log_data = {
             "function": f"{__name__}.{self.__class__.__name__}.{sys._getframe().f_code.co_name}",
             "message": "Writing policy request v2 to Dynamo",
             "request": new_request,
         }
         log.debug(log_data)
+
         try:
             await sync_to_async(self.policy_requests_table.put_item)(
                 Item=self._data_to_dynamo_replace(new_request)
@@ -505,11 +535,50 @@ class UserDynamoHandler(BaseDynamoHandler):
         matching_requests = []
         if requests["Items"]:
             items = self._data_from_dynamo_replace(requests["Items"])
+            items = await self.convert_policy_requests_to_v3(items)
             matching_requests.extend(items)
         return matching_requests
 
+    async def convert_policy_requests_to_v3(self, requests):
+        # Remove this function and calls to this function after a grace period of
+        changed = False
+        for request in requests:
+            if not request.get("version") in ["2"]:
+                continue
+            if request.get("extended_request") and not request.get("principal"):
+                principal_arn = request.pop("arn")
+                request["principal"] = {
+                    "principal_arn": principal_arn,
+                    "principal_type": "AwsResource",
+                }
+                request["extended_request"]["principal"] = {
+                    "principal_arn": principal_arn,
+                    "principal_type": "AwsResource",
+                }
+            request.pop("arn", None)
+            changes = (
+                request.get("extended_request", {})
+                .get("changes", {})
+                .get("changes", [])
+            )
+            for change in changes:
+                if not change.get("principal_arn"):
+                    continue
+                if not change.get("version") in ["2.0", "2", 2]:
+                    continue
+                change["principal"] = {
+                    "principal_arn": change["principal_arn"],
+                    "principal_type": "AwsResource",
+                }
+                change.pop("principal_arn")
+                change["version"] = "3.0"
+                changed = True
+        if changed:
+            self.parallel_write_table(self.policy_requests_table, requests)
+        return requests
+
     async def get_all_policy_requests(
-        self, status: str = "pending"
+        self, status: Optional[str] = "pending"
     ) -> List[Dict[str, Union[int, List[str], str]]]:
         """Return all policy requests. If a status is specified, only requests with the specified status will be
         returned.
@@ -520,6 +589,8 @@ class UserDynamoHandler(BaseDynamoHandler):
         requests = await sync_to_async(self.parallel_scan_table)(
             self.policy_requests_table
         )
+
+        requests = await self.convert_policy_requests_to_v3(requests)
 
         return_value = []
         if status:
@@ -1108,6 +1179,68 @@ class UserDynamoHandler(BaseDynamoHandler):
 
     async def get_all_pending_requests(self):
         return await self.get_all_requests(status="pending")
+
+    def batch_write_cloudtrail_events(self, items):
+        with self.cloudtrail_table.batch_writer(
+            overwrite_by_pkeys=["arn", "request_id"]
+        ) as batch:
+            for item in items:
+                batch.put_item(Item=self._data_to_dynamo_replace(item))
+        return True
+
+    async def get_top_cloudtrail_errors_by_arn(self, arn, n=5):
+        response: dict = await sync_to_async(self.cloudtrail_table.query)(
+            KeyConditionExpression=Key("arn").eq(arn)
+        )
+        items = response.get("Items", [])
+        aggregated_errors = defaultdict(dict)
+
+        for item in items:
+            if int(item["ttl"]) < int(time.time()):
+                continue
+            event_call = item["event_call"]
+            event_resource = item.get("resource", "")
+
+            event_string = f"{event_call}|||{event_resource}"
+            if not aggregated_errors.get(event_string):
+                aggregated_errors[event_string]["count"] = 0
+                aggregated_errors[event_string]["generated_policy"] = item.get(
+                    "generated_policy", {}
+                )
+            aggregated_errors[event_string]["count"] += 1
+
+        top_n_errors = {
+            k: v
+            for k, v in sorted(
+                aggregated_errors.items(),
+                key=lambda item: item[1]["count"],
+                reverse=True,
+            )[:n]
+        }
+
+        return top_n_errors
+
+    def count_arn_errors(self, error_count, items):
+        for item in items:
+            arn = item.get("arn")
+            if not error_count.get(arn):
+                error_count[arn] = 0
+            error_count[arn] += 1
+        return error_count
+
+    def count_cloudtrail_errors_by_arn(self):
+        error_count = {}
+        items = self.parallel_scan_table(
+            self.cloudtrail_table,
+            dynamodb_kwargs={
+                "Select": "SPECIFIC_ATTRIBUTES",
+                "ProjectionExpression": "arn",
+            },
+        )
+        error_count = self.count_arn_errors(
+            error_count, self._data_from_dynamo_replace(items)
+        )
+        return error_count
 
 
 class IAMRoleDynamoHandler(BaseDynamoHandler):

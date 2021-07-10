@@ -23,6 +23,7 @@ from consoleme.handlers.v1.policies import (
 )
 from consoleme.handlers.v1.roles import GetRolesHandler
 from consoleme.handlers.v1.saml import SamlHandler
+from consoleme.handlers.v2.audit import AuditRolesAccessHandler, AuditRolesHandler
 from consoleme.handlers.v2.challenge import (
     ChallengeGeneratorHandler,
     ChallengePollerHandler,
@@ -38,9 +39,13 @@ from consoleme.handlers.v2.index import (
     FrontendHandler,
 )
 from consoleme.handlers.v2.logout import LogOutHandler
+from consoleme.handlers.v2.managed_policies import (
+    ManagedPoliciesForAccountHandler,
+    ManagedPoliciesHandler,
+    ManagedPoliciesOnRoleHandler,
+)
 from consoleme.handlers.v2.policies import (
     CheckPoliciesHandler,
-    ManagedPoliciesHandler,
     PoliciesHandler,
     PoliciesPageConfigHandler,
 )
@@ -63,7 +68,12 @@ from consoleme.handlers.v2.self_service import (
     PermissionTemplatesHandler,
     SelfServiceConfigHandler,
 )
-from consoleme.handlers.v2.typeahead import ResourceTypeAheadHandlerV2
+from consoleme.handlers.v2.service_control_policy import ServiceControlPolicyHandler
+from consoleme.handlers.v2.templated_resources import TemplatedResourceDetailHandler
+from consoleme.handlers.v2.typeahead import (
+    ResourceTypeAheadHandlerV2,
+    SelfServiceStep1ResourceTypeahead,
+)
 from consoleme.handlers.v2.user import (
     LoginConfigurationHandler,
     LoginHandler,
@@ -132,10 +142,23 @@ def make_app(jwt_validator=None):
         (r"/api/v2/policies_page_config", PoliciesPageConfigHandler),
         (r"/api/v2/requests_page_config", RequestsPageConfigHandler),
         (r"/api/v2/generate_policy", GeneratePolicyHandler),
-        (r"/api/v2/managed_policies/(\d{12})", ManagedPoliciesHandler),
+        (r"/api/v2/managed_policies/(\d{12})", ManagedPoliciesForAccountHandler),
+        (r"/api/v2/managed_policies/(.*)", ManagedPoliciesHandler),
+        (
+            r"/api/v2/templated_resource/([a-zA-Z0-9_-]+)/(.*)",
+            TemplatedResourceDetailHandler,
+        ),
+        (
+            r"/api/v2/managed_policies_on_role/(\d{12})/(.*)",
+            ManagedPoliciesOnRoleHandler,
+        ),
         (r"/api/v2/login", LoginHandler),
         (r"/api/v2/login_configuration", LoginConfigurationHandler),
         (r"/api/v2/logout", LogOutHandler),
+        (
+            r"/api/v2/typeahead/self_service_resources",
+            SelfServiceStep1ResourceTypeahead,
+        ),
         (r"/api/v2/user", UserManagementHandler),
         (r"/api/v2/user_registration", UserRegistrationHandler),
         (r"/api/v2/policies", PoliciesHandler),
@@ -149,6 +172,7 @@ def make_app(jwt_validator=None):
             r"/api/v2/resources/(\d{12})/(s3|sqs|sns)(?:/([a-z\-1-9]+))?/(.*)",
             ResourceDetailHandler,
         ),
+        (r"/api/v2/service_control_policies/(.*)", ServiceControlPolicyHandler),
         (r"/api/v2/mtls/roles/(\d{12})/(.*)", RoleDetailAppHandler),
         (r"/api/v2/clone/role", RoleCloneHandler),
         (r"/api/v2/generate_changes/?", GenerateChangesHandler),
@@ -163,6 +187,8 @@ def make_app(jwt_validator=None):
         ),
         (r"/noauth/v1/challenge_generator/(.*)", ChallengeGeneratorHandler),
         (r"/noauth/v1/challenge_poller/([a-zA-Z0-9_-]+)", ChallengePollerHandler),
+        (r"/api/v2/audit/roles", AuditRolesHandler),
+        (r"/api/v2/audit/roles/(\d{12})/(.*)/access", AuditRolesAccessHandler),
         (r"/api/v2/.*", V2NotFoundHandler),
         (
             r"/(.*)",

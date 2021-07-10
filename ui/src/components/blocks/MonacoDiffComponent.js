@@ -1,9 +1,12 @@
 import React from "react";
 import { MonacoDiffEditor } from "react-monaco-editor";
 import PropTypes from "prop-types";
-import { getMonacoTriggerCharacters } from "../../helpers/utils";
+import {
+  getMonacoTriggerCharacters,
+  getStringFormat,
+  getLocalStorageSettings,
+} from "../../helpers/utils";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api.js";
-
 // This is a global setting, no need to do this multiple times - right now PolicyMonacoEditor.js already sets it
 // Setting it multiple times will result in duplicate results and requests made to the backend
 // monaco.languages.registerCompletionItemProvider("json", {
@@ -25,6 +28,8 @@ class MonacoDiffComponent extends React.Component {
       debounceWait: 300,
       modifiedEditor: null,
       triggerCharacters: getMonacoTriggerCharacters(),
+      language: "json",
+      theme: getLocalStorageSettings("editorTheme"),
     };
   }
 
@@ -32,8 +37,15 @@ class MonacoDiffComponent extends React.Component {
     this.onValueChange(newValue);
   }
 
+  componentDidMount() {
+    const { newValue } = this.props;
+    this.setState({
+      language: getStringFormat(newValue),
+    });
+  }
+
   editorDidMount(editor) {
-    editor.modifiedEditor.onDidChangeModelDecorations(() => {
+    editor._modifiedEditor.onDidChangeModelDecorations(() => {
       const { modifiedEditor } = this.state;
       const model = modifiedEditor.getModel();
       if (model === null || model.getModeId() !== "json") {
@@ -51,7 +63,7 @@ class MonacoDiffComponent extends React.Component {
       );
     });
     this.setState({
-      modifiedEditor: editor.modifiedEditor,
+      modifiedEditor: editor._modifiedEditor,
     });
   }
 
@@ -71,7 +83,7 @@ class MonacoDiffComponent extends React.Component {
     };
     return (
       <MonacoDiffEditor
-        language="json"
+        language={this.state.language}
         width="100%"
         height="500"
         original={oldValue}
@@ -80,7 +92,7 @@ class MonacoDiffComponent extends React.Component {
         editorDidMount={this.editorDidMount}
         options={options}
         onChange={this.onChange}
-        theme="vs-dark"
+        theme={this.state.theme}
         alwaysConsumeMouseWheel={false}
       />
     );

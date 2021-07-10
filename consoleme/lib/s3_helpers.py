@@ -59,6 +59,7 @@ def get_object(**kwargs):
                 assume_role=assume_role,
                 session_name=kwargs.get("session_name", "ConsoleMe"),
                 region=kwargs.get("region", config.region),
+                retry_max_attempts=2,
             )
         else:
             client = boto3.client("s3")
@@ -112,6 +113,7 @@ def map_operation_to_api(operation, default):
         "REST.GET.OBJECT": "s3:GetObject",
         "REST.GET.OBJECT_LOCK_CONFIGURATION": "s3:GetObjectLockConfiguration",
         "REST.GET.OBJECT_TAGGING": "s3:GetObjectTagging",
+        "REST.GET.OWNERSHIP_CONTROLS": "s3:GetBucketOwnershipControls",
         "REST.GET.POLICY_STATUS": "s3:GetBucketPolicyStatus",
         "REST.GET.PUBLIC_ACCESS_BLOCK": "s3:GetBucketPublicAccessBlock",
         "REST.GET.REPLICATION": "s3:GetReplicationConfiguration",

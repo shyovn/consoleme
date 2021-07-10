@@ -29,7 +29,10 @@ const useManagedPolicy = () => {
       changes: {
         changes: [
           {
-            principal_arn: arn,
+            principal: {
+              principal_arn: arn,
+              principal_type: "AwsResource",
+            },
             arn: state.managedPolicyArn,
             change_type: "managed_policy",
             action: state.actionType,
@@ -49,6 +52,7 @@ const useManagedPolicy = () => {
         type: "SET_MANAGED_POLICIES",
         policies,
       }),
+    resource: resource,
     addManagedPolicy: (arn) => dispatch({ type: "ADD_MANAGED_POLICY", arn }),
     deleteManagedPolicy: (arn) =>
       dispatch({ type: "DELETE_MANAGED_POLICY", arn }),

@@ -26,10 +26,17 @@ class UserProfileHandler(BaseAPIV1Handler):
         is_contractor = config.config_plugin().is_contractor(self.user)
         site_config = {
             "consoleme_logo": await get_random_security_logo(),
-            "google_tracking_uri": config.get("google_analytics.tracking_url"),
-            "documentation_url": config.get("documentation_page"),
+            "google_analytics": {
+                "tracking_id": config.get("google_analytics.tracking_id"),
+                "options": config.get("google_analytics.options", {}),
+            },
+            "documentation_url": config.get(
+                "documentation_page", "https://hawkins.gitbook.io/consoleme/"
+            ),
             "support_contact": config.get("support_contact"),
-            "support_chat_url": config.get("support_chat_url"),
+            "support_chat_url": config.get(
+                "support_chat_url", "https://discord.com/invite/nQVpNGGkYu"
+            ),
             "security_logo": config.get("security_logo.image"),
             "security_url": config.get("security_logo.url"),
         }

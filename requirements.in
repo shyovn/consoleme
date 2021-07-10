@@ -1,5 +1,6 @@
 aiozipkin
 asgiref # Allows sync_to_async call, executes synchronous code in its own threadpool.
+atlassian-python-api # Supports creating PRs in BitBucket
 bcrypt # Used for password hash/verification
 bleach
 boto3
@@ -7,6 +8,7 @@ cchardet
 celery[redis]
 cloudaux
 datamodel-code-generator
+decorator<5 # Internal requirement has decorator pinned to <5.
 deepdiff
 defusedxml
 ed25519
@@ -44,7 +46,9 @@ python-dateutil
 python-json-logger==0.1.11 # Needed until this is merged and new version created: https://github.com/madzak/python-json-logger/pull/113
 python3-saml
 pytz
+questionary
 redis
+redislite
 requests
 retry
 retrying

@@ -1,3 +1,4 @@
+import fnmatch
 import json
 import sys
 import time
@@ -32,10 +33,23 @@ from consoleme.exceptions.exceptions import (
     InvalidInvocationArgument,
     MissingConfigurationValue,
 )
-from consoleme.lib.cache import retrieve_json_data_from_redis_or_s3
+from consoleme.lib.account_indexers.aws_organizations import (
+    retrieve_org_structure,
+    retrieve_scps_for_organization,
+)
+from consoleme.lib.cache import (
+    retrieve_json_data_from_redis_or_s3,
+    store_json_results_in_redis_and_s3,
+)
+from consoleme.lib.generic import sort_dict
 from consoleme.lib.plugins import get_plugin_by_name
 from consoleme.lib.redis import RedisHandler, redis_hget
-from consoleme.models import CloneRoleRequestModel, RoleCreationRequestModel
+from consoleme.models import (
+    CloneRoleRequestModel,
+    RoleCreationRequestModel,
+    ServiceControlPolicyArrayModel,
+    ServiceControlPolicyModel,
+)
 
 ALL_IAM_MANAGED_POLICIES: dict = {}
 ALL_IAM_MANAGED_POLICIES_LAST_UPDATE: int = 0
@@ -167,9 +181,10 @@ async def get_all_iam_managed_policies_for_account(account_id):
         return json.loads(ALL_IAM_MANAGED_POLICIES.get(account_id, "[]"))
     else:
         s3_bucket = config.get("account_resource_cache.s3.bucket")
-        s3_key = config.get("account_resource_cache.s3.file", "").format(
-            resource_type="managed_policies", account_id=account_id
-        )
+        s3_key = config.get(
+            "account_resource_cache.s3.file",
+            "account_resource_cache/cache_{resource_type}_{account_id}_v1.json.gz",
+        ).format(resource_type="managed_policies", account_id=account_id)
         return await retrieve_json_data_from_redis_or_s3(
             s3_bucket=s3_bucket, s3_key=s3_key, default=[]
         )
@@ -195,9 +210,13 @@ async def get_resource_account(arn: str) -> str:
         await retrieve_json_data_from_redis_or_s3(
             redis_key=resources_from_aws_config_redis_key,
             s3_bucket=config.get("aws_config_cache_combined.s3.bucket"),
-            s3_key=config.get("aws_config_cache_combined.s3.file"),
+            s3_key=config.get(
+                "aws_config_cache_combined.s3.file",
+                "aws_config_cache_combined/aws_config_resource_cache_combined_v1.json.gz",
+            ),
             redis_data_type="hash",
         )
+
     resource_info = await redis_hget(resources_from_aws_config_redis_key, arn)
     if resource_info:
         return json.loads(resource_info).get("accountId", "")
@@ -341,6 +360,7 @@ async def fetch_sns_topic(account_id: str, region: str, resource_name: str) -> d
             region_name=config.region,
             endpoint_url=f"https://sts.{config.region}.amazonaws.com",
         ),
+        retry_max_attempts=2,
     )
 
     result: Dict = await sync_to_async(get_topic_attributes)(
@@ -352,6 +372,7 @@ async def fetch_sns_topic(account_id: str, region: str, resource_name: str) -> d
             region_name=config.region,
             endpoint_url=f"https://sts.{config.region}.amazonaws.com",
         ),
+        retry_max_attempts=2,
     )
 
     tags: Dict = await sync_to_async(client.list_tags_for_resource)(ResourceArn=arn)
@@ -387,6 +408,7 @@ async def fetch_sqs_queue(account_id: str, region: str, resource_name: str) -> d
             region_name=config.region,
             endpoint_url=f"https://sts.{config.region}.amazonaws.com",
         ),
+        retry_max_attempts=2,
     )
 
     result: Dict = await sync_to_async(get_queue_attributes)(
@@ -399,6 +421,7 @@ async def fetch_sqs_queue(account_id: str, region: str, resource_name: str) -> d
             region_name=config.region,
             endpoint_url=f"https://sts.{config.region}.amazonaws.com",
         ),
+        retry_max_attempts=2,
     )
 
     tags: Dict = await sync_to_async(list_queue_tags)(
@@ -410,6 +433,7 @@ async def fetch_sqs_queue(account_id: str, region: str, resource_name: str) -> d
             region_name=config.region,
             endpoint_url=f"https://sts.{config.region}.amazonaws.com",
         ),
+        retry_max_attempts=2,
     )
     result["TagSet"]: list = []
     result["QueueUrl"]: str = queue_url
@@ -451,6 +475,7 @@ async def get_bucket_location_with_fallback(
                 region_name=config.region,
                 endpoint_url=f"https://sts.{config.region}.amazonaws.com",
             ),
+            retry_max_attempts=2,
         )
         bucket_location = bucket_location_res.get("LocationConstraint", fallback_region)
         if bucket_location == "EU":
@@ -492,6 +517,7 @@ async def fetch_s3_bucket(account_id: str, bucket_name: str) -> dict:
                 region_name=config.region,
                 endpoint_url=f"https://sts.{config.region}.amazonaws.com",
             ),
+            retry_max_attempts=2,
         )
         created_time_stamp = bucket_resource.creation_date
         if created_time_stamp:
@@ -511,6 +537,7 @@ async def fetch_s3_bucket(account_id: str, bucket_name: str) -> dict:
                 region_name=config.region,
                 endpoint_url=f"https://sts.{config.region}.amazonaws.com",
             ),
+            retry_max_attempts=2,
         )
     except ClientError as e:
         if "NoSuchBucketPolicy" in str(e):
@@ -527,6 +554,7 @@ async def fetch_s3_bucket(account_id: str, bucket_name: str) -> dict:
                 region_name=config.region,
                 endpoint_url=f"https://sts.{config.region}.amazonaws.com",
             ),
+            retry_max_attempts=2,
         )
     except ClientError as e:
         if "NoSuchTagSet" in str(e):
@@ -597,6 +625,7 @@ def apply_managed_policy_to_role(
         account_number=account_id,
         assume_role=config.get("policies.role_name"),
         session_name=session_name,
+        retry_max_attempts=2,
     )
 
     client.attach_role_policy(RoleName=role.get("RoleName"), PolicyArn=policy_arn)
@@ -676,6 +705,7 @@ async def fetch_role_details(account_id, role_name):
         region=config.region,
         assume_role=config.get("policies.role_name"),
         session_name="fetch_role_details",
+        retry_max_attempts=2,
     )
     try:
         iam_role = await sync_to_async(iam_resource.Role)(role_name)
@@ -739,6 +769,7 @@ async def create_iam_role(create_model: RoleCreationRequestModel, username):
         region=config.region,
         assume_role=config.get("policies.role_name"),
         session_name="create_role_" + username,
+        retry_max_attempts=2,
     )
     results = {"errors": 0, "role_created": "false", "action_results": []}
     try:
@@ -900,6 +931,7 @@ async def clone_iam_role(clone_model: CloneRoleRequestModel, username):
         region=config.region,
         assume_role=config.get("policies.role_name"),
         session_name="clone_role_" + username,
+        retry_max_attempts=2,
     )
     results = {"errors": 0, "role_created": "false", "action_results": []}
     try:
@@ -1182,6 +1214,7 @@ async def get_enabled_regions_for_account(account_id: str) -> Set[str]:
         account_number=account_id,
         assume_role=config.get("policies.role_name"),
         read_only=True,
+        retry_max_attempts=2,
     )
 
     regions = await sync_to_async(client.describe_regions)()
@@ -1262,3 +1295,327 @@ async def validate_iam_policy(policy: str, log_data: Dict):
         policy, log_data, policy_type="IDENTITY_POLICY"
     )
     return parliament_findings + access_analyzer_findings
+
+
+async def get_all_scps(force_sync=False) -> Dict[str, List[ServiceControlPolicyModel]]:
+    """Retrieve a dictionary containing all Service Control Policies across organizations
+
+    Args:
+        force_sync: force a cache update
+    """
+    redis_key = config.get(
+        "cache_scps_across_organizations.redis.key.all_scps_key", "ALL_AWS_SCPS"
+    )
+    scps = await retrieve_json_data_from_redis_or_s3(
+        redis_key,
+        s3_bucket=config.get("cache_scps_across_organizations.s3.bucket"),
+        s3_key=config.get(
+            "cache_scps_across_organizations.s3.file", "scps/cache_scps_v1.json.gz"
+        ),
+        default={},
+        max_age=86400,
+    )
+    if force_sync or not scps:
+        scps = await cache_all_scps()
+    scp_models = {}
+    for account, org_scps in scps.items():
+        scp_models[account] = [ServiceControlPolicyModel(**scp) for scp in org_scps]
+    return scp_models
+
+
+async def cache_all_scps() -> Dict[str, Any]:
+    """Store a dictionary of all Service Control Policies across organizations in the cache"""
+    all_scps = {}
+    for organization in config.get("cache_accounts_from_aws_organizations", []):
+        org_account_id = organization.get("organizations_master_account_id")
+        role_to_assume = organization.get(
+            "organizations_master_role_to_assume", config.get("policies.role_name")
+        )
+        if not org_account_id:
+            raise MissingConfigurationValue(
+                "Your AWS Organizations Master Account ID is not specified in configuration. "
+                "Unable to sync accounts from "
+                "AWS Organizations"
+            )
+
+        if not role_to_assume:
+            raise MissingConfigurationValue(
+                "ConsoleMe doesn't know what role to assume to retrieve account information "
+                "from AWS Organizations. please set the appropriate configuration value."
+            )
+        org_scps = await retrieve_scps_for_organization(
+            org_account_id, role_to_assume=role_to_assume, region=config.region
+        )
+        all_scps[org_account_id] = org_scps
+    redis_key = config.get(
+        "cache_scps_across_organizations.redis.key.all_scps_key", "ALL_AWS_SCPS"
+    )
+    s3_bucket = None
+    s3_key = None
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev", "test"]:
+        s3_bucket = config.get("cache_scps_across_organizations.s3.bucket")
+        s3_key = config.get(
+            "cache_scps_across_organizations.s3.file", "scps/cache_scps_v1.json.gz"
+        )
+    await store_json_results_in_redis_and_s3(
+        all_scps,
+        redis_key=redis_key,
+        s3_bucket=s3_bucket,
+        s3_key=s3_key,
+    )
+    return all_scps
+
+
+async def get_org_structure(force_sync=False) -> Dict[str, Any]:
+    """Retrieve a dictionary containing the organization structure
+
+    Args:
+        force_sync: force a cache update
+    """
+    redis_key = config.get(
+        "cache_organization_structure.redis.key.org_structure_key", "AWS_ORG_STRUCTURE"
+    )
+    org_structure = await retrieve_json_data_from_redis_or_s3(
+        redis_key,
+        s3_bucket=config.get("cache_organization_structure.s3.bucket"),
+        s3_key=config.get(
+            "cache_organization_structure.s3.file",
+            "scps/cache_org_structure_v1.json.gz",
+        ),
+        default={},
+    )
+    if force_sync or not org_structure:
+        org_structure = await cache_org_structure()
+    return org_structure
+
+
+async def cache_org_structure() -> Dict[str, Any]:
+    """Store a dictionary of the organization structure in the cache"""
+    all_org_structure = {}
+    for organization in config.get("cache_accounts_from_aws_organizations", []):
+        org_account_id = organization.get("organizations_master_account_id")
+        role_to_assume = organization.get(
+            "organizations_master_role_to_assume", config.get("policies.role_name")
+        )
+        if not org_account_id:
+            raise MissingConfigurationValue(
+                "Your AWS Organizations Master Account ID is not specified in configuration. "
+                "Unable to sync accounts from "
+                "AWS Organizations"
+            )
+
+        if not role_to_assume:
+            raise MissingConfigurationValue(
+                "ConsoleMe doesn't know what role to assume to retrieve account information "
+                "from AWS Organizations. please set the appropriate configuration value."
+            )
+        org_structure = await retrieve_org_structure(
+            org_account_id, region=config.region
+        )
+        all_org_structure.update(org_structure)
+    redis_key = config.get(
+        "cache_organization_structure.redis.key.org_structure_key", "AWS_ORG_STRUCTURE"
+    )
+    s3_bucket = None
+    s3_key = None
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev", "test"]:
+        s3_bucket = config.get("cache_organization_structure.s3.bucket")
+        s3_key = config.get(
+            "cache_organization_structure.s3.file",
+            "scps/cache_org_structure_v1.json.gz",
+        )
+    await store_json_results_in_redis_and_s3(
+        all_org_structure,
+        redis_key=redis_key,
+        s3_bucket=s3_bucket,
+        s3_key=s3_key,
+    )
+    return all_org_structure
+
+
+async def _is_member_of_ou(
+    identifier: str, ou: Dict[str, Any]
+) -> Tuple[bool, Set[str]]:
+    """Recursively walk org structure to determine if the account or OU is in the org and, if so, return all OUs of which the account or OU is a member
+
+    Args:
+        identifier: AWS account or OU ID
+        ou: dictionary representing the organization/organizational unit structure to search
+    """
+    found = False
+    ou_path = set()
+    for child in ou.get("Children", []):
+        if child.get("Id") == identifier:
+            found = True
+        elif child.get("Type") == "ORGANIZATIONAL_UNIT":
+            found, ou_path = await _is_member_of_ou(identifier, child)
+        if found:
+            ou_path.add(ou.get("Id"))
+            break
+    return found, ou_path
+
+
+async def get_organizational_units_for_account(identifier: str) -> Set[str]:
+    """Return a set of Organizational Unit IDs for a given account or OU ID
+
+    Args:
+        identifier: AWS account or OU ID
+    """
+    all_orgs = await get_org_structure()
+    organizational_units = set()
+    for org_id, org_structure in all_orgs.items():
+        found, organizational_units = await _is_member_of_ou(identifier, org_structure)
+        if found:
+            break
+    if not organizational_units:
+        log.warning("could not find account in organization")
+    return organizational_units
+
+
+async def _scp_targets_account_or_ou(
+    scp: ServiceControlPolicyModel, identifier: str, organizational_units: Set[str]
+) -> bool:
+    """Return True if the provided SCP targets the account or OU identifier provided
+
+    Args:
+        scp: Service Control Policy whose targets we check
+        identifier: AWS account or OU ID
+        organizational_units: set of IDs for OUs of which the identifier is a member
+    """
+    for target in scp.targets:
+        if target.target_id == identifier or target.target_id in organizational_units:
+            return True
+    return False
+
+
+async def get_scps_for_account_or_ou(identifier: str) -> ServiceControlPolicyArrayModel:
+    """Retrieve a list of Service Control Policies for the account or OU specified by the identifier
+
+    Args:
+        identifier: AWS account or OU ID
+    """
+    all_scps = await get_all_scps()
+    account_ous = await get_organizational_units_for_account(identifier)
+    scps_for_account = []
+    for org_account_id, scps in all_scps.items():
+        # Iterate through each org's SCPs and see if the provided account_id is in the targets
+        for scp in scps:
+            if await _scp_targets_account_or_ou(scp, identifier, account_ous):
+                scps_for_account.append(scp)
+    scps = ServiceControlPolicyArrayModel(__root__=scps_for_account)
+    return scps
+
+
+async def minimize_iam_policy_statements(
+    inline_iam_policy_statements: List[Dict], disregard_sid=True
+) -> List[Dict]:
+    """
+    Minimizes a list of inline IAM policy statements.
+
+    1. Policies that are identical except for the resources will have the resources merged into a single statement
+    with the same actions, effects, conditions, etc.
+
+    2. Policies that have an identical resource, but different actions, will be combined if the rest of the policy
+    is identical.
+    :param inline_iam_policy_statements: A list of IAM policy statement dictionaries
+    :return: A potentially more compact list of IAM policy statement dictionaries
+    """
+    exclude_ids = []
+    minimized_statements = []
+
+    inline_iam_policy_statements = await normalize_policies(
+        inline_iam_policy_statements
+    )
+
+    for i in range(len(inline_iam_policy_statements)):
+        inline_iam_policy_statement = inline_iam_policy_statements[i]
+        if disregard_sid:
+            inline_iam_policy_statement.pop("Sid", None)
+        if i in exclude_ids:
+            # We've already combined this policy with another. Ignore it.
+            continue
+        for j in range(i + 1, len(inline_iam_policy_statements)):
+            if j in exclude_ids:
+                # We've already combined this policy with another. Ignore it.
+                continue
+            inline_iam_policy_statement_to_compare = inline_iam_policy_statements[j]
+            if disregard_sid:
+                inline_iam_policy_statement_to_compare.pop("Sid", None)
+            # Check to see if policy statements are identical except for a given element. Merge the policies
+            # if possible.
+            for element in [
+                "Resource",
+                "Action",
+                "NotAction",
+                "NotResource",
+                "NotPrincipal",
+            ]:
+                if not (
+                    inline_iam_policy_statement.get(element)
+                    or inline_iam_policy_statement_to_compare.get(element)
+                ):
+                    # This function won't handle `Condition`.
+                    continue
+                diff = DeepDiff(
+                    inline_iam_policy_statement,
+                    inline_iam_policy_statement_to_compare,
+                    ignore_order=True,
+                    exclude_paths=[f"root['{element}']"],
+                )
+                if not diff:
+                    exclude_ids.append(j)
+                    # Policy can be minimized
+                    inline_iam_policy_statement[element] = sorted(
+                        list(
+                            set(
+                                inline_iam_policy_statement[element]
+                                + inline_iam_policy_statement_to_compare[element]
+                            )
+                        )
+                    )
+                    break
+
+    for i in range(len(inline_iam_policy_statements)):
+        if i not in exclude_ids:
+            inline_iam_policy_statements[i] = sort_dict(inline_iam_policy_statements[i])
+            minimized_statements.append(inline_iam_policy_statements[i])
+    # TODO(cccastrapel): Intelligently combine actions and/or resources if they include wildcards
+    minimized_statements = await normalize_policies(minimized_statements)
+    return minimized_statements
+
+
+async def normalize_policies(policies: List[Any]) -> List[Any]:
+    """
+    Normalizes policy statements to ensure appropriate AWS policy elements are lists (such as actions and resources),
+    lowercase, and sorted. It will remove duplicate entries and entries that are superseded by other elements.
+    """
+
+    for policy in policies:
+        for element in [
+            "Resource",
+            "Action",
+            "NotAction",
+            "NotResource",
+            "NotPrincipal",
+        ]:
+            if not policy.get(element):
+                continue
+            if isinstance(policy.get(element), str):
+                policy[element] = [policy[element]]
+            policy[element] = list(set([x.lower() for x in policy[element]]))
+            modified_elements = set()
+            for i in range(len(policy[element])):
+                matched = False
+                # Sorry for the magic. this is iterating through all elements of a list that aren't the current element
+                for compare_value in policy[element][:i] + policy[element][(i + 1) :]:
+                    if fnmatch.fnmatch(policy[element][i], compare_value):
+                        matched = True
+                        break
+                if not matched:
+                    modified_elements.add(policy[element][i])
+            policy[element] = sorted(modified_elements)
+    return policies

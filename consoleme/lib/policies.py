@@ -7,9 +7,6 @@ from collections import defaultdict
 from typing import Dict, List
 
 import ujson as json
-from asgiref.sync import sync_to_async
-from botocore.exceptions import ClientError
-from cloudaux.aws.sts import boto3_cached_conn
 from deepdiff import DeepDiff
 from policy_sentry.util.actions import get_service_from_action
 
@@ -270,158 +267,6 @@ async def can_update_cancel_requests_v2(requester_username, user, groups):
     return can_update
 
 
-async def update_resource_policy(
-    arn: str,
-    resource_type: str,
-    account_id: str,
-    region: str,
-    policy_changes: dict,
-    resource_details: dict,
-):
-    # TODO: Prevent race conditions by ensuring policy hasn't been changed since user loaded existing policy
-    function = f"{__name__}.{sys._getframe().f_code.co_name}"
-
-    stats.count(
-        function,
-        tags={
-            "arn": arn,
-            "resource_type": resource_type,
-            "account_id": account_id,
-            "region": region,
-        },
-    )
-
-    log_data = {
-        "function": function,
-        "arn": arn,
-        "resource_type": resource_type,
-        "account_id": account_id,
-        "region": region,
-        "policy_changes": policy_changes,
-        "resource_details": resource_details,
-    }
-
-    log.debug(log_data)
-
-    result = {"status": "success"}
-
-    client = await sync_to_async(boto3_cached_conn)(
-        resource_type,
-        service_type="client",
-        future_expiration_minutes=15,
-        account_number=account_id,
-        assume_role=config.get("policies.role_name"),
-        region=region or config.region,
-        session_name="ConsoleMe",
-        arn_partition="aws",
-        sts_client_kwargs=dict(
-            region_name=config.region,
-            endpoint_url=f"https://sts.{config.region}.amazonaws.com",
-        ),
-    )
-
-    resource = await sync_to_async(boto3_cached_conn)(
-        resource_type,
-        service_type="resource",
-        future_expiration_minutes=15,
-        account_number=account_id,
-        assume_role=config.get("policies.role_name"),
-        region=region or config.region,
-        session_name="ConsoleMe",
-        arn_partition="aws",
-        sts_client_kwargs=dict(
-            region_name=config.region,
-            endpoint_url=f"https://sts.{config.region}.amazonaws.com",
-        ),
-    )
-
-    changes: bool = False
-
-    resource_name: str = arn.split(":")[5]
-    for change in policy_changes:
-        try:
-            if change.get("type") == "ResourcePolicy":
-                proposed_policy = change["value"]
-                changes = True
-                if resource_details.get("Policy"):
-                    if json.loads(proposed_policy) == resource_details["Policy"]:
-                        result = {
-                            "status": "error",
-                            "message": "No changes were found between the updated and existing policy.",
-                        }
-                        return result
-                if resource_type == "s3":
-                    await sync_to_async(client.put_bucket_policy)(
-                        Bucket=resource_name, Policy=proposed_policy
-                    )
-                elif resource_type == "sqs":
-                    queue = await sync_to_async(resource.get_queue_by_name)(
-                        QueueName=resource_name
-                    )
-                    await sync_to_async(queue.set_attributes)(
-                        Attributes={"Policy": proposed_policy}
-                    )
-                elif resource_type == "sns":
-                    topic = await sync_to_async(resource.Topic)(arn)
-                    await sync_to_async(topic.set_attributes)(
-                        AttributeName="Policy", AttributeValue=proposed_policy
-                    )
-            elif change.get("type") == "update_tag":
-                changes = True
-                if resource_type == "s3":
-                    resource_details["TagSet"].append(
-                        {"Key": change["name"], "Value": change["value"]}
-                    )
-                    await sync_to_async(client.put_bucket_tagging)(
-                        Bucket=resource_name,
-                        Tagging={"TagSet": resource_details["TagSet"]},
-                    )
-                elif resource_type == "sqs":
-                    await sync_to_async(client.tag_queue)(
-                        QueueUrl=resource_details["QueueUrl"],
-                        Tags={change["name"]: change["value"]},
-                    )
-                elif resource_type == "sns":
-                    await sync_to_async(client.tag_resource)(
-                        ResourceArn=resource_details["TopicArn"],
-                        Tags=[{"Key": change["name"], "Value": change["value"]}],
-                    )
-            elif change.get("type") == "delete_tag":
-                changes = True
-                if resource_type == "s3":
-                    resulting_tagset = []
-
-                    for tag in resource_details["TagSet"]:
-                        if tag.get("Key") != change["name"]:
-                            resulting_tagset.append(tag)
-
-                    resource_details["TagSet"] = resulting_tagset
-                    await sync_to_async(client.put_bucket_tagging)(
-                        Bucket=resource_name,
-                        Tagging={"TagSet": resource_details["TagSet"]},
-                    )
-                elif resource_type == "sqs":
-                    await sync_to_async(client.untag_queue)(
-                        QueueUrl=resource_details["QueueUrl"], TagKeys=[change["name"]]
-                    )
-                elif resource_type == "sns":
-                    await sync_to_async(client.untag_resource)(
-                        ResourceArn=resource_details["TopicArn"],
-                        TagKeys=[change["name"]],
-                    )
-        except ClientError as e:
-            log_data["message"] = "Error"
-            log_data["error"] = e
-            log.error(log_data, exc_info=True)
-            result["status"] = "error"
-            result["error"] = str(e)
-            return result
-    if not changes:
-        result = {"status": "error", "message": "No changes detected."}
-        return result
-    return result
-
-
 async def update_role_policy(events):
     result = {"status": "success"}
 
@@ -452,6 +297,8 @@ async def get_policy_request_uri(request):
 
 
 async def get_policy_request_uri_v2(extended_request: ExtendedRequestModel):
+    if extended_request.request_url:
+        return extended_request.request_url
     return f"{config.get('url')}/policies/request/{extended_request.id}"
 
 
@@ -646,12 +493,6 @@ async def get_formatted_policy_changes(account_id, arn, request):
                     }
                 )
     return {"changes": formatted_policy_changes, "role": existing_role}
-
-
-async def should_auto_approve_policy(events, user, user_groups):
-    aws = get_plugin_by_name(config.get("plugins.aws", "default_aws"))()
-    result = await aws.should_auto_approve_policy(events, user, user_groups)
-    return result
 
 
 async def should_auto_approve_policy_v2(
@@ -1011,7 +852,11 @@ async def get_url_for_resource(
 
 
 async def get_aws_config_history_url_for_resource(
-    account_id, resource_id, resource_name, technology, region="us-east-1"
+    account_id,
+    resource_id,
+    resource_name,
+    technology,
+    region=config.get("aws.region", "us-east-1"),
 ):
     if config.get("get_aws_config_history_url_for_resource.generate_conglomo_url"):
         return await get_conglomo_url_for_resource(

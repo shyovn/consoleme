@@ -1,8 +1,15 @@
+# Warning: The following configuration file is an example, and it is insecure by default. Please carefully
+# review and change values accordingly before deploying to a production environment. You are responsible
+# for your deployment.
+
 extends:
   - example_config_header_auth.yaml
 
 environment: dev
 development: true
+
+tornado:
+  xsrf: false # So you can test POST requests with Postman
 
 # A development configuration can specify a specific user to impersonate locally.
 _development_user_override: consoleme_admin@example.com

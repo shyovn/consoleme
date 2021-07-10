@@ -1,3 +1,4 @@
+import gzip
 import json
 import sys
 import time
@@ -62,6 +63,10 @@ async def store_json_results_in_redis_and_s3(
         tags={"redis_key": redis_key, "s3_bucket": s3_bucket, "s3_key": s3_key},
     )
 
+    # If we've defined an S3 key, but not a bucket, let's use the default bucket if it's defined in configuration.
+    if s3_key and not s3_bucket:
+        s3_bucket = config.get("consoleme_s3_bucket")
+
     if redis_key:
         if redis_data_type == "str":
             if isinstance(data, str):
@@ -77,13 +82,18 @@ async def store_json_results_in_redis_and_s3(
         red.hset(last_updated_redis_key, redis_key, last_updated)
 
     if s3_bucket and s3_key:
-        data_for_s3 = {"last_updated": last_updated, "data": data}
+        data_for_s3 = json.dumps(
+            {"last_updated": last_updated, "data": data},
+            cls=SetEncoder,
+            default=json_encoder,
+            indent=2,
+        ).encode()
+        if s3_key.endswith(".gz"):
+            data_for_s3 = gzip.compress(data_for_s3)
         put_object(
             Bucket=s3_bucket,
             Key=s3_key,
-            Body=json.dumps(
-                data_for_s3, cls=SetEncoder, default=json_encoder, indent=2
-            ).encode(),
+            Body=data_for_s3,
         )
 
 
@@ -100,7 +110,7 @@ async def retrieve_json_data_from_redis_or_s3(
 ):
     """
     Retrieve data from Redis as a priority. If data is unavailable in Redis, fall back to S3 and attempt to store
-    data in Redis for quicker retrieval later
+    data in Redis for quicker retrieval later.
 
     :param redis_data_type: "str" or "hash", depending on how the data is stored in Redis
     :param redis_key: Redis Key to retrieve data from
@@ -118,6 +128,11 @@ async def retrieve_json_data_from_redis_or_s3(
         f"{function}.called",
         tags={"redis_key": redis_key, "s3_bucket": s3_bucket, "s3_key": s3_key},
     )
+
+    # If we've defined an S3 key, but not a bucket, let's use the default bucket if it's defined in configuration.
+    if s3_key and not s3_bucket:
+        s3_bucket = config.get("consoleme_s3_bucket")
+
     data = None
     if redis_key:
         if redis_data_type == "str":
@@ -132,12 +147,17 @@ async def retrieve_json_data_from_redis_or_s3(
             current_time = int(time.time())
             last_updated = int(red.hget(last_updated_redis_key, redis_key))
             if current_time - last_updated > max_age:
-                raise ExpiredData(f"Data in Redis is older than {max_age} seconds.")
+                data = None
+                # Fall back to S3 if expired.
+                if not s3_bucket or not s3_key:
+                    raise ExpiredData(f"Data in Redis is older than {max_age} seconds.")
 
     # Fall back to S3 if there's no data
     if not data and s3_bucket and s3_key:
         s3_object = get_object(Bucket=s3_bucket, Key=s3_key)
         s3_object_content = await sync_to_async(s3_object["Body"].read)()
+        if s3_key.endswith(".gz"):
+            s3_object_content = gzip.decompress(s3_object_content)
         data_object = json.loads(s3_object_content, object_hook=json_object_hook)
         data = data_object["data"]
 

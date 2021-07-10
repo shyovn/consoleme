@@ -10,10 +10,11 @@ command: celery -A consoleme.celery_tasks.celery_tasks worker --loglevel=info -l
 from __future__ import absolute_import
 
 import json  # We use a separate SetEncoder here so we cannot use ujson
+import os
 import sys
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import celery
 import sentry_sdk
@@ -21,6 +22,7 @@ import ujson
 from asgiref.sync import async_to_sync
 from billiard.exceptions import SoftTimeLimitExceeded
 from botocore.exceptions import ClientError
+from celery import group
 from celery.app.task import Context
 from celery.concurrency import asynpool
 from celery.schedules import crontab
@@ -50,7 +52,11 @@ from consoleme.lib.account_indexers import (
     cache_cloud_accounts,
     get_account_id_to_name_mapping,
 )
-from consoleme.lib.aws import get_enabled_regions_for_account
+from consoleme.lib.aws import (
+    cache_all_scps,
+    cache_org_structure,
+    get_enabled_regions_for_account,
+)
 from consoleme.lib.aws_config import aws_config
 from consoleme.lib.cache import (
     retrieve_json_data_from_redis_or_s3,
@@ -58,13 +64,21 @@ from consoleme.lib.cache import (
 )
 from consoleme.lib.cloud_credential_authorization_mapping import (
     generate_and_store_credential_authorization_mapping,
+    generate_and_store_reverse_authorization_mapping,
 )
 from consoleme.lib.dynamo import IAMRoleDynamoHandler, UserDynamoHandler
+from consoleme.lib.event_bridge.access_denies import (
+    detect_cloudtrail_denies_and_update_cache,
+)
+from consoleme.lib.event_bridge.role_updates import detect_role_changes_and_update_cache
+from consoleme.lib.generic import un_wrap_json_and_dump_values
 from consoleme.lib.git import store_iam_resources_in_git
 from consoleme.lib.plugins import get_plugin_by_name
 from consoleme.lib.policies import get_aws_config_history_url_for_resource
 from consoleme.lib.redis import RedisHandler
 from consoleme.lib.requests import cache_all_policy_requests
+from consoleme.lib.self_service.typeahead import cache_self_service_typeahead
+from consoleme.lib.templated_resources import cache_resource_templates
 from consoleme.lib.timeout import Timeout
 
 asynpool.PROC_ALIVE_TIMEOUT = config.get("celery.asynpool_proc_alive_timeout", 60.0)
@@ -92,9 +106,31 @@ class Celery(celery.Celery):
 
 app = Celery(
     "tasks",
-    broker=config.get(f"celery.broker.{config.region}", "redis://127.0.0.1:6379/1"),
-    backend=config.get(f"celery.backend.{config.region}", "redis://127.0.0.1:6379/2"),
+    broker=config.get(
+        f"celery.broker.{config.region}",
+        config.get("celery.broker.global", "redis://127.0.0.1:6379/1"),
+    ),
+    backend=config.get(
+        f"celery.backend.{config.region}",
+        config.get("celery.broker.global", "redis://127.0.0.1:6379/2"),
+    ),
 )
+
+if config.get("redis.use_redislite"):
+    import tempfile
+
+    import redislite
+
+    redislite_db_path = os.path.join(
+        config.get("redis.redislite.db_path", tempfile.NamedTemporaryFile().name)
+    )
+    redislite_client = redislite.Redis(redislite_db_path)
+    redislite_socket_path = f"redis+socket://{redislite_client.socket_file}"
+    app = Celery(
+        "tasks",
+        broker=f"{redislite_socket_path}?virtual_host=1",
+        backend=f"{redislite_socket_path}?virtual_host=2",
+    )
 
 app.conf.result_expires = config.get("celery.result_expires", 60)
 app.conf.worker_prefetch_multiplier = config.get("celery.worker_prefetch_multiplier", 4)
@@ -142,7 +178,7 @@ def report_celery_last_success_metrics() -> bool:
         if last_success == 0:
             log_data["message"] = "Last Success Value is 0"
             log_data["task_last_success_key"] = f"{task}.last_success"
-            log.error(log_data)
+            log.warn(log_data)
         stats.gauge(f"{task}.time_since_last_success", current_time - last_success)
         red.set(f"{task}.time_since_last_success", current_time - last_success)
     red.set(
@@ -209,7 +245,15 @@ def refresh_dynamic_config_in_worker(**kwargs):
 
     dynamic_config = red.get("DYNAMIC_CONFIG_CACHE")
     if not dynamic_config:
-        log.error({**log_data, "error": "Unable to retrieve Dynamic Config from Redis"})
+        log.warn(
+            {
+                **log_data,
+                "error": (
+                    "Unable to retrieve Dynamic Config from Redis. "
+                    "This can be safely ignored if your dynamic config is empty."
+                ),
+            }
+        )
         return
     dynamic_config_j = json.loads(dynamic_config)
     if config.CONFIG.config.get("dynamic_config", {}) != dynamic_config_j:
@@ -408,12 +452,34 @@ def report_revoked_task(**kwargs):
     stats.timer("celery.revoked_task", tags=error_tags)
 
 
+def is_task_already_running(fun, args):
+    """
+    Returns True if an identical task for a given function (and arguments) is already being
+    ran by Celery.
+    """
+    task_id = None
+    if celery.current_task:
+        task_id = celery.current_task.request.id
+    if not task_id:
+        return False
+    log.debug(task_id)
+
+    active_tasks = app.control.inspect()._request("active")
+    for _, tasks in active_tasks.items():
+        for task in tasks:
+            if task.get("id") == task_id:
+                continue
+            if task.get("name") == fun and task.get("args") == args:
+                return True
+    return False
+
+
 @retry(
     stop_max_attempt_number=4,
     wait_exponential_multiplier=1000,
     wait_exponential_max=1000,
 )
-def _add_role_to_redis(redis_key: str, role_entry: dict) -> None:
+def _add_role_to_redis(redis_key: str, role_entry: Dict) -> None:
     """
     This function will add IAM role data to redis so that policy details can be quickly retrieved by the policies
     endpoint.
@@ -424,13 +490,13 @@ def _add_role_to_redis(redis_key: str, role_entry: dict) -> None:
     ----------
     redis_key : str
         The redis key (hash)
-    role_entry : dict
+    role_entry : Dict
         The role entry
         Example: {'name': 'nameOfRole', 'accountId': '123456789012', 'arn': 'arn:aws:iam::123456789012:role/nameOfRole',
         'templated': None, 'ttl': 1562510908, 'policy': '<json_formatted_policy>'}
     """
     try:
-        red.hset(redis_key, role_entry["arn"], json.dumps(role_entry))
+        red.hset(redis_key, str(role_entry["arn"]), str(json.dumps(role_entry)))
     except Exception as e:  # noqa
         stats.count(
             "cache_roles_for_account.error",
@@ -446,10 +512,14 @@ def _add_role_to_redis(redis_key: str, role_entry: dict) -> None:
         raise
 
 
-@app.task(soft_time_limit=3600)
+@app.task(soft_time_limit=7200)
 def cache_cloudtrail_errors_by_arn() -> Dict:
     function: str = f"{__name__}.{sys._getframe().f_code.co_name}"
     log_data: Dict = {"function": function}
+    if is_task_already_running(function, []):
+        log_data["message"] = "Skipping task: An identical task is currently running"
+        log.debug(log_data)
+        return log_data
     cloudtrail_errors: Dict = internal_policies.error_count_by_arn()
     if not cloudtrail_errors:
         cloudtrail_errors = {}
@@ -462,6 +532,7 @@ def cache_cloudtrail_errors_by_arn() -> Dict:
         json.dumps(cloudtrail_errors),
     )
     log_data["number_of_roles_with_errors"]: len(cloudtrail_errors.keys())
+    log_data["number_errors"]: sum(cloudtrail_errors.values())
     log.debug(log_data)
     return log_data
 
@@ -616,7 +687,10 @@ def cache_policies_table_details() -> bool:
         "environment"
     ) in ["dev", "test"]:
         s3_bucket = config.get("cache_policies_table_details.s3.bucket")
-        s3_key = config.get("cache_policies_table_details.s3.file")
+        s3_key = config.get(
+            "cache_policies_table_details.s3.file",
+            "policies_table/cache_policies_table_details_v1.json.gz",
+        )
     async_to_sync(store_json_results_in_redis_and_s3)(
         items,
         redis_key=config.get("policies.redis_policies_key", "ALL_POLICIES"),
@@ -677,9 +751,10 @@ def cache_roles_for_account(account_id: str) -> bool:
         async_to_sync(store_json_results_in_redis_and_s3)(
             all_iam_resources,
             s3_bucket=config.get("cache_iam_resources_for_account.s3.bucket"),
-            s3_key=config.get("cache_iam_resources_for_account.s3.file", "").format(
-                account_id=account_id
-            ),
+            s3_key=config.get(
+                "cache_iam_resources_for_account.s3.file",
+                "get_account_authorization_details/get_account_authorization_details_{account_id}_v1.json.gz",
+            ).format(account_id=account_id),
         )
 
         iam_roles = all_iam_resources["RoleDetailList"]
@@ -687,9 +762,10 @@ def cache_roles_for_account(account_id: str) -> bool:
         async_to_sync(store_json_results_in_redis_and_s3)(
             iam_roles,
             s3_bucket=config.get("cache_roles_for_account.s3.bucket"),
-            s3_key=config.get("cache_roles_for_account.s3.file", "").format(
-                resource_type="iam_roles", account_id=account_id
-            ),
+            s3_key=config.get(
+                "cache_roles_for_account.s3.file",
+                "account_resource_cache/cache_{resource_type}_{account_id}_v1.json.gz",
+            ).format(resource_type="iam_roles", account_id=account_id),
         )
 
         ttl: int = int((datetime.utcnow() + timedelta(hours=36)).timestamp())
@@ -726,27 +802,32 @@ def cache_roles_for_account(account_id: str) -> bool:
 
 
 @app.task(soft_time_limit=3600)
-def cache_roles_across_accounts() -> Dict:
+def cache_roles_across_accounts(
+    run_subtasks: bool = True, wait_for_subtask_completion: bool = True
+) -> Dict:
     function = f"{__name__}.{sys._getframe().f_code.co_name}"
 
     cache_key = config.get("aws.iamroles_redis_key", "IAM_ROLE_CACHE")
 
     log_data = {"function": function, "cache_key": cache_key}
-    num_accounts = 0
+    accounts_d: Dict[str, str] = async_to_sync(get_account_id_to_name_mapping)()
+    tasks = []
     if config.region == config.get("celery.active_region", config.region) or config.get(
         "environment"
-    ) in ["dev", "test"]:
+    ) in ["dev"]:
         # First, get list of accounts
-        accounts_d = async_to_sync(get_account_id_to_name_mapping)()
         # Second, call tasks to enumerate all the roles across all accounts
         for account_id in accounts_d.keys():
             if config.get("environment") in ["prod", "dev"]:
-                cache_roles_for_account.delay(account_id)
-                num_accounts += 1
+                tasks.append(cache_roles_for_account.s(account_id))
             else:
                 if account_id in config.get("celery.test_account_ids", []):
-                    cache_roles_for_account.delay(account_id)
-                    num_accounts += 1
+                    tasks.append(cache_roles_for_account.s(account_id))
+        if run_subtasks:
+            results = group(*tasks).apply_async()
+            if wait_for_subtask_completion:
+                # results.join() forces function to wait until all tasks are complete
+                results.join(disable_sync_subtasks=False)
     else:
         dynamo = IAMRoleDynamoHandler()
         # In non-active regions, we just want to sync DDB data to Redis
@@ -766,35 +847,41 @@ def cache_roles_across_accounts() -> Dict:
         for arn in roles_to_delete_from_cache:
             all_roles.pop(arn, None)
     log_data["num_roles"] = len(all_roles)
-    # Store full list of roles in a single place
+    # Store full list of roles in a single place. This list will be ~30 minutes out of date.
     async_to_sync(store_json_results_in_redis_and_s3)(
         all_roles,
+        redis_key=cache_key,
+        redis_data_type="hash",
         s3_bucket=config.get(
             "cache_roles_across_accounts.all_roles_combined.s3.bucket"
         ),
-        s3_key=config.get("cache_roles_across_accounts.all_roles_combined.s3.file"),
+        s3_key=config.get(
+            "cache_roles_across_accounts.all_roles_combined.s3.file",
+            "account_resource_cache/cache_all_roles_v1.json.gz",
+        ),
     )
 
     stats.count(f"{function}.success")
-    log_data["num_accounts"] = num_accounts
+    log_data["num_accounts"] = len(accounts_d)
     log.debug(log_data)
     return log_data
 
 
 @app.task(soft_time_limit=1800, **default_retry_kwargs)
 def cache_managed_policies_for_account(account_id: str) -> Dict[str, Union[str, int]]:
-    managed_policies: list[dict] = get_all_managed_policies(
+    managed_policies: List[Dict] = get_all_managed_policies(
         account_number=account_id,
         assume_role=config.get("policies.role_name"),
         region=config.region,
     )
-    all_policies: list = []
+    all_policies: List = []
     for policy in managed_policies:
         all_policies.append(policy.get("Arn"))
 
     log_data = {
         "function": f"{__name__}.{sys._getframe().f_code.co_name}",
         "account_id": account_id,
+        "message": "Successfully cached IAM managed policies for account",
         "number_managed_policies": len(all_policies),
     }
     log.debug(log_data)
@@ -810,16 +897,17 @@ def cache_managed_policies_for_account(account_id: str) -> Dict[str, Union[str, 
         "environment"
     ) in ["dev", "test"]:
         s3_bucket = config.get("account_resource_cache.s3.bucket")
-        s3_key = config.get("account_resource_cache.s3.file", "").format(
-            resource_type="managed_policies", account_id=account_id
-        )
+        s3_key = config.get(
+            "account_resource_cache.s3.file",
+            "account_resource_cache/cache_{resource_type}_{account_id}_v1.json.gz",
+        ).format(resource_type="managed_policies", account_id=account_id)
         async_to_sync(store_json_results_in_redis_and_s3)(
             all_policies, s3_bucket=s3_bucket, s3_key=s3_key
         )
     return log_data
 
 
-@app.task(soft_time_limit=120)
+@app.task(soft_time_limit=3600)
 def cache_managed_policies_across_accounts() -> bool:
     function = f"{__name__}.{sys._getframe().f_code.co_name}"
     # First, get list of accounts
@@ -836,51 +924,180 @@ def cache_managed_policies_across_accounts() -> bool:
     return True
 
 
-@app.task(soft_time_limit=120)
-def cache_s3_buckets_across_accounts() -> bool:
+@app.task(soft_time_limit=3600)
+def cache_s3_buckets_across_accounts(
+    run_subtasks: bool = True, wait_for_subtask_completion: bool = True
+) -> Dict[str, Any]:
     function: str = f"{__name__}.{sys._getframe().f_code.co_name}"
-    # First, get list of accounts
-    accounts_d: list = async_to_sync(get_account_id_to_name_mapping)()
-    # Second, call tasks to enumerate all the roles across all accounts
-    for account_id in accounts_d.keys():
-        if config.get("environment") == "prod":
-            cache_s3_buckets_for_account.delay(account_id)
-        else:
-            if account_id in config.get("celery.test_account_ids", []):
-                cache_s3_buckets_for_account.delay(account_id)
+    s3_bucket_redis_key: str = config.get("redis.s3_buckets_key", "S3_BUCKETS")
+    s3_bucket = config.get("account_resource_cache.s3_combined.bucket")
+    s3_key = config.get(
+        "account_resource_cache.s3_combined.file",
+        "account_resource_cache/cache_s3_combined_v1.json.gz",
+    )
+
+    accounts_d: Dict[str, str] = async_to_sync(get_account_id_to_name_mapping)()
+    log_data = {
+        "function": function,
+        "num_accounts": len(accounts_d.keys()),
+        "run_subtasks": run_subtasks,
+        "wait_for_subtask_completion": wait_for_subtask_completion,
+    }
+    tasks = []
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev"]:
+        # Call tasks to enumerate all S3 buckets across all accounts
+        for account_id in accounts_d.keys():
+            if config.get("environment") in ["prod", "dev"]:
+                tasks.append(cache_s3_buckets_for_account.s(account_id))
+            else:
+                if account_id in config.get("celery.test_account_ids", []):
+                    tasks.append(cache_s3_buckets_for_account.s(account_id))
+    log_data["num_tasks"] = len(tasks)
+    if tasks and run_subtasks:
+        results = group(*tasks).apply_async()
+        if wait_for_subtask_completion:
+            # results.join() forces function to wait until all tasks are complete
+            results.join(disable_sync_subtasks=False)
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev", "test"]:
+        all_buckets = red.hgetall(s3_bucket_redis_key)
+        async_to_sync(store_json_results_in_redis_and_s3)(
+            all_buckets, s3_bucket=s3_bucket, s3_key=s3_key
+        )
+    else:
+        redis_result_set = async_to_sync(retrieve_json_data_from_redis_or_s3)(
+            s3_bucket=s3_bucket, s3_key=s3_key
+        )
+        async_to_sync(store_json_results_in_redis_and_s3)(
+            redis_result_set,
+            redis_key=s3_bucket_redis_key,
+            redis_data_type="hash",
+        )
+    log.debug(
+        {**log_data, "message": "Successfully cached s3 buckets across known accounts"}
+    )
     stats.count(f"{function}.success")
-    return True
+    return log_data
 
 
-@app.task(soft_time_limit=120)
-def cache_sqs_queues_across_accounts() -> bool:
+@app.task(soft_time_limit=3600)
+def cache_sqs_queues_across_accounts(
+    run_subtasks: bool = True, wait_for_subtask_completion: bool = True
+) -> Dict[str, Any]:
     function: str = f"{__name__}.{sys._getframe().f_code.co_name}"
-    # First, get list of accounts
-    accounts_d: list = async_to_sync(get_account_id_to_name_mapping)()
-    # Second, call tasks to enumerate all the roles across all accounts
-    for account_id in accounts_d.keys():
-        if config.get("environment") == "prod":
-            cache_sqs_queues_for_account.delay(account_id)
-        else:
-            if account_id in config.get("celery.test_account_ids", []):
-                cache_sqs_queues_for_account.delay(account_id)
+    sqs_queue_redis_key: str = config.get("redis.sqs_queues_key", "SQS_QUEUES")
+    s3_bucket = config.get("account_resource_cache.sqs_combined.bucket")
+    s3_key = config.get(
+        "account_resource_cache.sqs_combined.file",
+        "account_resource_cache/cache_sqs_queues_combined_v1.json.gz",
+    )
+
+    accounts_d: Dict[str, str] = async_to_sync(get_account_id_to_name_mapping)()
+    log_data = {
+        "function": function,
+        "num_accounts": len(accounts_d.keys()),
+        "run_subtasks": run_subtasks,
+        "wait_for_subtask_completion": wait_for_subtask_completion,
+    }
+    tasks = []
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev"]:
+        for account_id in accounts_d.keys():
+            if config.get("environment") in ["prod", "dev"]:
+                tasks.append(cache_sqs_queues_for_account.s(account_id))
+            else:
+                if account_id in config.get("celery.test_account_ids", []):
+                    tasks.append(cache_sqs_queues_for_account.s(account_id))
+    log_data["num_tasks"] = len(tasks)
+    if tasks and run_subtasks:
+        results = group(*tasks).apply_async()
+        if wait_for_subtask_completion:
+            # results.join() forces function to wait until all tasks are complete
+            results.join(disable_sync_subtasks=False)
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev", "test"]:
+        all_queues = red.hgetall(sqs_queue_redis_key)
+        async_to_sync(store_json_results_in_redis_and_s3)(
+            all_queues, s3_bucket=s3_bucket, s3_key=s3_key
+        )
+    else:
+        redis_result_set = async_to_sync(retrieve_json_data_from_redis_or_s3)(
+            s3_bucket=s3_bucket, s3_key=s3_key
+        )
+        async_to_sync(store_json_results_in_redis_and_s3)(
+            redis_result_set,
+            redis_key=sqs_queue_redis_key,
+            redis_data_type="hash",
+        )
+    log.debug(
+        {**log_data, "message": "Successfully cached SQS queues across known accounts"}
+    )
     stats.count(f"{function}.success")
-    return True
+    return log_data
 
 
-@app.task(soft_time_limit=120)
-def cache_sns_topics_across_accounts() -> bool:
+@app.task(soft_time_limit=3600)
+def cache_sns_topics_across_accounts(
+    run_subtasks: bool = True, wait_for_subtask_completion: bool = True
+) -> Dict[str, Any]:
     function: str = f"{__name__}.{sys._getframe().f_code.co_name}"
+    sns_topic_redis_key: str = config.get("redis.sns_topics_key", "SNS_TOPICS")
+    s3_bucket = config.get("account_resource_cache.sns_topics_combined.bucket")
+    s3_key = config.get(
+        "account_resource_cache.{resource_type}_topics_combined.file",
+        "account_resource_cache/cache_{resource_type}_combined_v1.json.gz",
+    ).format(resource_type="sns_topics")
+
     # First, get list of accounts
-    accounts_d: list = async_to_sync(get_account_id_to_name_mapping)()
-    for account_id in accounts_d.keys():
-        if config.get("environment") == "prod":
-            cache_sns_topics_for_account.delay(account_id)
-        else:
-            if account_id in config.get("celery.test_account_ids", []):
-                cache_sns_topics_for_account.delay(account_id)
+    accounts_d: Dict[str, str] = async_to_sync(get_account_id_to_name_mapping)()
+    log_data = {
+        "function": function,
+        "num_accounts": len(accounts_d.keys()),
+        "run_subtasks": run_subtasks,
+        "wait_for_subtask_completion": wait_for_subtask_completion,
+    }
+    tasks = []
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev"]:
+        for account_id in accounts_d.keys():
+            if config.get("environment") in ["prod", "dev"]:
+                tasks.append(cache_sns_topics_for_account.s(account_id))
+            else:
+                if account_id in config.get("celery.test_account_ids", []):
+                    tasks.append(cache_sns_topics_for_account.s(account_id))
+    log_data["num_tasks"] = len(tasks)
+    if tasks and run_subtasks:
+        results = group(*tasks).apply_async()
+        if wait_for_subtask_completion:
+            # results.join() forces function to wait until all tasks are complete
+            results.join(disable_sync_subtasks=False)
+    if config.region == config.get("celery.active_region", config.region) or config.get(
+        "environment"
+    ) in ["dev", "test"]:
+        all_topics = red.hgetall(sns_topic_redis_key)
+        async_to_sync(store_json_results_in_redis_and_s3)(
+            all_topics, s3_bucket=s3_bucket, s3_key=s3_key
+        )
+    else:
+        redis_result_set = async_to_sync(retrieve_json_data_from_redis_or_s3)(
+            s3_bucket=s3_bucket, s3_key=s3_key
+        )
+        async_to_sync(store_json_results_in_redis_and_s3)(
+            redis_result_set,
+            redis_key=sns_topic_redis_key,
+            redis_data_type="hash",
+        )
+    log.debug(
+        {**log_data, "message": "Successfully cached SNS topics across known accounts"}
+    )
     stats.count(f"{function}.success")
-    return True
+    return log_data
 
 
 @app.task(soft_time_limit=1800, **default_retry_kwargs)
@@ -914,6 +1131,7 @@ def cache_sqs_queues_for_account(account_id: str) -> Dict[str, Union[str, int]]:
     log_data = {
         "function": f"{__name__}.{sys._getframe().f_code.co_name}",
         "account_id": account_id,
+        "message": "Successfully cached SQS queues for account",
         "number_sqs_queues": len(all_queues),
     }
     log.debug(log_data)
@@ -925,10 +1143,11 @@ def cache_sqs_queues_for_account(account_id: str) -> Dict[str, Union[str, int]]:
     if config.region == config.get("celery.active_region", config.region) or config.get(
         "environment"
     ) in ["dev", "test"]:
-        s3_bucket = config.get("account_resource_cache.s3.bucket")
-        s3_key = config.get("account_resource_cache.s3.file", "").format(
-            resource_type="sqs_queues", account_id=account_id
-        )
+        s3_bucket = config.get("account_resource_cache.sqs.bucket")
+        s3_key = config.get(
+            "account_resource_cache.{resource_type}.file",
+            "account_resource_cache/cache_{resource_type}_{account_id}_v1.json.gz",
+        ).format(resource_type="sqs_queues", account_id=account_id)
         async_to_sync(store_json_results_in_redis_and_s3)(
             all_queues, s3_bucket=s3_bucket, s3_key=s3_key
         )
@@ -959,6 +1178,7 @@ def cache_sns_topics_for_account(account_id: str) -> Dict[str, Union[str, int]]:
     log_data = {
         "function": f"{__name__}.{sys._getframe().f_code.co_name}",
         "account_id": account_id,
+        "message": "Successfully cached SNS topics for account",
         "number_sns_topics": len(all_topics),
     }
     log.debug(log_data)
@@ -971,9 +1191,10 @@ def cache_sns_topics_for_account(account_id: str) -> Dict[str, Union[str, int]]:
         "environment"
     ) in ["dev", "test"]:
         s3_bucket = config.get("account_resource_cache.s3.bucket")
-        s3_key = config.get("account_resource_cache.s3.file", "").format(
-            resource_type="sns_topics", account_id=account_id
-        )
+        s3_key = config.get(
+            "account_resource_cache.s3.file",
+            "account_resource_cache/cache_{resource_type}_{account_id}_v1.json.gz",
+        ).format(resource_type="sns_topics", account_id=account_id)
         async_to_sync(store_json_results_in_redis_and_s3)(
             all_topics, s3_bucket=s3_bucket, s3_key=s3_key
         )
@@ -982,13 +1203,13 @@ def cache_sns_topics_for_account(account_id: str) -> Dict[str, Union[str, int]]:
 
 @app.task(soft_time_limit=1800, **default_retry_kwargs)
 def cache_s3_buckets_for_account(account_id: str) -> Dict[str, Union[str, int]]:
-    s3_buckets: list = list_buckets(
+    s3_buckets: List = list_buckets(
         account_number=account_id,
         assume_role=config.get("policies.role_name"),
         region=config.region,
         read_only=True,
     )
-    buckets: list = []
+    buckets: List = []
     for bucket in s3_buckets["Buckets"]:
         buckets.append(bucket["Name"])
     s3_bucket_key: str = config.get("redis.s3_buckets_key", "S3_BUCKETS")
@@ -997,21 +1218,23 @@ def cache_s3_buckets_for_account(account_id: str) -> Dict[str, Union[str, int]]:
     log_data = {
         "function": f"{__name__}.{sys._getframe().f_code.co_name}",
         "account_id": account_id,
+        "message": "Successfully cached S3 buckets for account",
         "number_s3_buckets": len(buckets),
     }
     log.debug(log_data)
     stats.count(
         "cache_s3_buckets_for_account",
-        tags={"account_id": account_id, "number_sns_topics": len(buckets)},
+        tags={"account_id": account_id, "number_s3_buckets": len(buckets)},
     )
 
     if config.region == config.get("celery.active_region", config.region) or config.get(
         "environment"
     ) in ["dev", "test"]:
         s3_bucket = config.get("account_resource_cache.s3.bucket")
-        s3_key = config.get("account_resource_cache.s3.file", "").format(
-            resource_type="s3_buckets", account_id=account_id
-        )
+        s3_key = config.get(
+            "account_resource_cache.s3.file",
+            "account_resource_cache/cache_{resource_type}_{account_id}_v1.json.gz",
+        ).format(resource_type="s3_buckets", account_id=account_id)
         async_to_sync(store_json_results_in_redis_and_s3)(
             buckets, s3_bucket=s3_bucket, s3_key=s3_key
         )
@@ -1083,11 +1306,13 @@ def clear_old_redis_iam_cache() -> bool:
     return True
 
 
-@app.task(soft_time_limit=1800, **default_retry_kwargs)
+@app.task(soft_time_limit=3600, **default_retry_kwargs)
 def cache_resources_from_aws_config_for_account(account_id) -> dict:
     function: str = f"{__name__}.{sys._getframe().f_code.co_name}"
     s3_bucket = config.get("aws_config_cache.s3.bucket")
-    s3_key = config.get("aws_config_cache.s3.file", "").format(account_id=account_id)
+    s3_key = config.get(
+        "aws_config_cache.s3.file", "aws_config_cache/cache_{account_id}_v1.json.gz"
+    ).format(account_id=account_id)
     dynamo = UserDynamoHandler()
     # Only query in active region, otherwise get data from DDB
     if config.region == config.get("celery.active_region", config.region) or config.get(
@@ -1112,7 +1337,7 @@ def cache_resources_from_aws_config_for_account(account_id) -> dict:
                 redis_result_set[result["arn"]] = json.dumps(result)
         if redis_result_set:
             async_to_sync(store_json_results_in_redis_and_s3)(
-                redis_result_set,
+                un_wrap_json_and_dump_values(redis_result_set),
                 redis_key=config.get(
                     "aws_config_cache.redis_key", "AWSCONFIG_RESOURCE_CACHE"
                 ),
@@ -1137,28 +1362,44 @@ def cache_resources_from_aws_config_for_account(account_id) -> dict:
     log_data = {
         "function": function,
         "account_id": account_id,
+        "message": "Successfully cached resources from AWS Config for account",
         "number_resources_synced": len(redis_result_set),
     }
     log.debug(log_data)
     return log_data
 
 
-@app.task(soft_time_limit=1800)
-def cache_resources_from_aws_config_across_accounts() -> bool:
+@app.task(soft_time_limit=3600)
+def cache_resources_from_aws_config_across_accounts(
+    run_subtasks: bool = True,
+    wait_for_subtask_completion: bool = True,
+) -> Dict[str, Union[Union[str, int], Any]]:
     function = f"{__name__}.{sys._getframe().f_code.co_name}"
     resource_redis_cache_key = config.get(
         "aws_config_cache.redis_key", "AWSCONFIG_RESOURCE_CACHE"
     )
 
+    log_data = {
+        "function": function,
+        "resource_redis_cache_key": resource_redis_cache_key,
+    }
+
+    tasks = []
     # First, get list of accounts
     accounts_d = async_to_sync(get_account_id_to_name_mapping)()
     # Second, call tasks to enumerate all the roles across all accounts
     for account_id in accounts_d.keys():
         if config.get("environment") in ["prod", "dev"]:
-            cache_resources_from_aws_config_for_account.delay(account_id)
+            tasks.append(cache_resources_from_aws_config_for_account.s(account_id))
         else:
             if account_id in config.get("celery.test_account_ids", []):
-                cache_resources_from_aws_config_for_account.delay(account_id)
+                tasks.append(cache_resources_from_aws_config_for_account.s(account_id))
+    if tasks:
+        if run_subtasks:
+            results = group(*tasks).apply_async()
+            if wait_for_subtask_completion:
+                # results.join() forces function to wait until all tasks are complete
+                results.join(disable_sync_subtasks=False)
 
     # Delete roles in Redis cache with expired TTL
     all_resources = red.hgetall(resource_redis_cache_key)
@@ -1169,7 +1410,11 @@ def cache_resources_from_aws_config_across_accounts() -> bool:
             if datetime.fromtimestamp(resource_entry["ttl"]) < datetime.utcnow():
                 expired_arns.append(arn)
         if expired_arns:
+            for expired_arn in expired_arns:
+                all_resources.pop(expired_arn, None)
             red.hdel(resource_redis_cache_key, *expired_arns)
+
+        log_data["number_of_resources"] = len(all_resources)
 
         # Cache all resource ARNs into a single file. Note: This runs synchronously with this task. This task triggers
         # resource collection on all accounts to happen asynchronously. That means when we store or delete data within
@@ -1180,12 +1425,15 @@ def cache_resources_from_aws_config_across_accounts() -> bool:
             # Refresh all resources after deletion of expired entries
             all_resources = red.hgetall(resource_redis_cache_key)
             s3_bucket = config.get("aws_config_cache_combined.s3.bucket")
-            s3_key = config.get("aws_config_cache_combined.s3.file")
+            s3_key = config.get(
+                "aws_config_cache_combined.s3.file",
+                "aws_config_cache_combined/aws_config_resource_cache_combined_v1.json.gz",
+            )
             async_to_sync(store_json_results_in_redis_and_s3)(
                 all_resources, s3_bucket=s3_bucket, s3_key=s3_key
             )
     stats.count(f"{function}.success")
-    return True
+    return log_data
 
 
 @app.task(soft_time_limit=1800)
@@ -1213,7 +1461,7 @@ def get_iam_role_limit() -> dict:
         success_message = "Task successfully completed"
 
         # First, get list of accounts
-        accounts_d: dict = async_to_sync(get_account_id_to_name_mapping)()
+        accounts_d: Dict = async_to_sync(get_account_id_to_name_mapping)()
         num_accounts = len(accounts_d.keys())
         for account_id, account_name in accounts_d.items():
             try:
@@ -1303,19 +1551,162 @@ def cache_cloud_account_mapping() -> Dict:
 @app.task(soft_time_limit=1800, **default_retry_kwargs)
 def cache_credential_authorization_mapping() -> Dict:
     function = f"{__name__}.{sys._getframe().f_code.co_name}"
+    log_data = {
+        "function": function,
+    }
+    if is_task_already_running(function, []):
+        log_data["message"] = "Skipping task: An identical task is currently running"
+        log.debug(log_data)
+        return log_data
 
     authorization_mapping = async_to_sync(
         generate_and_store_credential_authorization_mapping
     )()
 
+    reverse_mapping = async_to_sync(generate_and_store_reverse_authorization_mapping)(
+        authorization_mapping
+    )
+
+    log_data["num_group_authorizations"] = len(authorization_mapping)
+    log_data["num_identities"] = len(reverse_mapping)
+    log.debug(
+        {
+            **log_data,
+            "message": "Successfully cached cloud credential authorization mapping",
+        }
+    )
+    return log_data
+
+
+@app.task(soft_time_limit=1800, **default_retry_kwargs)
+def cache_scps_across_organizations() -> Dict:
+    function = f"{__name__}.{sys._getframe().f_code.co_name}"
+    scps = async_to_sync(cache_all_scps)()
     log_data = {
         "function": function,
-        "message": "Successfully cached cloud credential authorization mapping",
-        "num_group_authorizations": len(authorization_mapping),
+        "message": "Successfully cached service control policies",
+        "num_organizations": len(scps),
     }
-
     log.debug(log_data)
     return log_data
+
+
+@app.task(soft_time_limit=1800, **default_retry_kwargs)
+def cache_organization_structure() -> Dict:
+    function = f"{__name__}.{sys._getframe().f_code.co_name}"
+    org_structure = async_to_sync(cache_org_structure)()
+    log_data = {
+        "function": function,
+        "message": "Successfully cached organization structure",
+        "num_organizations": len(org_structure),
+    }
+    log.debug(log_data)
+    return log_data
+
+
+@app.task(soft_time_limit=1800, **default_retry_kwargs)
+def cache_resource_templates_task() -> Dict:
+    function = f"{__name__}.{sys._getframe().f_code.co_name}"
+    templated_file_array = async_to_sync(cache_resource_templates)()
+    log_data = {
+        "function": function,
+        "message": "Successfully cached resource templates",
+        "num_templated_files": len(templated_file_array.templated_resources),
+    }
+    log.debug(log_data)
+    return log_data
+
+
+@app.task(soft_time_limit=1800, **default_retry_kwargs)
+def cache_self_service_typeahead_task() -> Dict:
+    function = f"{__name__}.{sys._getframe().f_code.co_name}"
+    self_service_typeahead = async_to_sync(cache_self_service_typeahead)()
+    log_data = {
+        "function": function,
+        "message": "Successfully cached roles and templates for self service typeahead",
+        "num_typeahead_entries": len(self_service_typeahead.typeahead_entries),
+    }
+    log.debug(log_data)
+    return log_data
+
+
+@app.task(soft_time_limit=1800, **default_retry_kwargs)
+def trigger_credential_mapping_refresh_from_role_changes():
+    """
+    This task triggers a role cache refresh for any role that a change was detected for. This feature requires an
+    Event Bridge rule monitoring Cloudtrail for your accounts for IAM role mutation.
+
+    This task will trigger a credential authorization refresh if any changes were detected.
+
+    This task should run in all regions to force IAM roles to be refreshed in each region's cache on change.
+    :return:
+    """
+    function = f"{__name__}.{sys._getframe().f_code.co_name}"
+    if not config.get(
+        "celery.trigger_credential_mapping_refresh_from_role_changes.enabled"
+    ):
+        return {
+            "function": function,
+            "message": "Not running Celery task because it is not enabled.",
+        }
+    roles_changed = detect_role_changes_and_update_cache(app)
+    log_data = {
+        "function": function,
+        "message": "Successfully checked role changes",
+        "num_roles_changed": len(roles_changed),
+    }
+    if roles_changed:
+        # Trigger credential authorization mapping refresh. We don't want credential authorization mapping refreshes
+        # running in parallel, so the cache_credential_authorization_mapping is protected to prevent parallel runs.
+        # This task can run in parallel without negative impact.
+        cache_credential_authorization_mapping.apply_async(countdown=30)
+    log.debug(log_data)
+    return log_data
+
+
+@app.task(soft_time_limit=1800, **default_retry_kwargs)
+def cache_cloudtrail_denies():
+    """
+    This task caches acess denies reported by Cloudtrail. This feature requires an
+    Event Bridge rule monitoring Cloudtrail for your accounts for access deny errors.
+    """
+    function = f"{__name__}.{sys._getframe().f_code.co_name}"
+    if not config.get("celery.cache_cloudtrail_denies.enabled"):
+        return {
+            "function": function,
+            "message": "Not running Celery task because it is not enabled.",
+        }
+    if not (
+        config.region == config.get("celery.active_region", config.region)
+        or config.get("environment") in ["dev", "test"]
+    ):
+        return {
+            "function": function,
+            "message": "Not running Celery task in inactive region",
+        }
+    ct_events = async_to_sync(detect_cloudtrail_denies_and_update_cache)()
+    if ct_events:
+        # Spawn off a task to cache errors by ARN for the UI
+        cache_cloudtrail_errors_by_arn.delay()
+    log_data = {
+        "function": function,
+        "message": "Successfully cached cloudtrail denies",
+        "num_cloudtrail_denies": len(ct_events),
+    }
+    log.debug(log_data)
+    return log_data
+
+
+@app.task(soft_time_limit=60, **default_retry_kwargs)
+def refresh_iam_role(role_arn):
+    """
+    This task is called on demand to asynchronously refresh an AWS IAM role in Redis/DDB
+
+    """
+    account_id = role_arn.split(":")[4]
+    async_to_sync(aws().fetch_iam_role)(
+        account_id, role_arn, force_refresh=True, run_sync=True
+    )
 
 
 schedule_30_minute = timedelta(seconds=1800)
@@ -1407,7 +1798,38 @@ schedule = {
         "options": {"expires": 1000},
         "schedule": schedule_5_minutes,
     },
+    "cache_scps_across_organizations": {
+        "task": "consoleme.celery_tasks.celery_tasks.cache_scps_across_organizations",
+        "options": {"expires": 1000},
+        "schedule": schedule_1_hour,
+    },
+    "cache_organization_structure": {
+        "task": "consoleme.celery_tasks.celery_tasks.cache_organization_structure",
+        "options": {"expires": 1000},
+        "schedule": schedule_1_hour,
+    },
+    "cache_resource_templates_task": {
+        "task": "consoleme.celery_tasks.celery_tasks.cache_resource_templates_task",
+        "options": {"expires": 1000},
+        "schedule": schedule_30_minute,
+    },
+    "cache_self_service_typeahead_task": {
+        "task": "consoleme.celery_tasks.celery_tasks.cache_self_service_typeahead_task",
+        "options": {"expires": 1000},
+        "schedule": schedule_30_minute,
+    },
+    "trigger_credential_mapping_refresh_from_role_changes": {
+        "task": "consoleme.celery_tasks.celery_tasks.trigger_credential_mapping_refresh_from_role_changes",
+        "options": {"expires": 300},
+        "schedule": schedule_minute,
+    },
+    "cache_cloudtrail_denies": {
+        "task": "consoleme.celery_tasks.celery_tasks.cache_cloudtrail_denies",
+        "options": {"expires": 300},
+        "schedule": schedule_minute,
+    },
 }
+
 
 if internal_celery_tasks and isinstance(internal_celery_tasks, dict):
     schedule = {**schedule, **internal_celery_tasks}

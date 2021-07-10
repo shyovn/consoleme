@@ -162,14 +162,10 @@ variable "sync_accounts_from_organizations" {
   default     = false
 }
 
-variable "sync_accounts_from_organizations_master_account_id" {
+variable "sync_accounts_from_organizations_account_map" {
+  type        = list(map(string))
   description = "Organizations master account ID"
-  default     = null
-}
-
-variable "sync_accounts_from_organizations_role_to_assume" {
-  description = "Organizations master role to assume"
-  default     = "ConsoleMeTarget"
+  default     = []
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -244,4 +240,9 @@ variable "logout_url" {
 variable "user_facing_url" {
   type    = string
   default = ""
+}
+
+variable "consoleme_repo" {
+  type    = string
+  default = "https://github.com/Netflix/consoleme/"
 }

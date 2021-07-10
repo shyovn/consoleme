@@ -33,7 +33,7 @@ class TestUserProfile(AsyncHTTPTestCase):
             response_j,
             {
                 "site_config": {
-                    "google_tracking_uri": None,
+                    "google_analytics": {"tracking_id": None, "options": {}},
                     "documentation_url": "https://github.com/Netflix/consoleme/",
                     "support_contact": "consoleme-support@example.com",
                     "support_chat_url": "https://www.example.com/slack/channel",
@@ -52,9 +52,13 @@ class TestUserProfile(AsyncHTTPTestCase):
                 "can_logout": False,
                 "pages": {
                     "header": {
-                        "custom_header_message_route": ".*",
-                        "custom_header_message_title": "",
-                        "custom_header_message_text": "",
+                        "custom_header_message_route": config.get(
+                            "example_config.routes"
+                        ),
+                        "custom_header_message_title": config.get(
+                            "example_config.title"
+                        ),
+                        "custom_header_message_text": config.get("example_config.text"),
                     },
                     "groups": {"enabled": False},
                     "users": {"enabled": False},

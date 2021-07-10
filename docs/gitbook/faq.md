@@ -22,7 +22,7 @@ We use [datamodel-code-generator](https://github.com/koxudaxi/datamodel-code-gen
 If you make changes to [ConsoleMe's Swagger specification](https://github.com/Netflix/consoleme/blob/master/swagger.yaml), you'll need to re-generate the [Pydantic Models file ](https://github.com/Netflix/consoleme/blob/master/consoleme/models.py)with the following command:
 
 ```text
-datamodel-codegen --input swagger.yaml --output consoleme/models.py
+ datamodel-codegen --target-python-version 3.8 --base-class consoleme.lib.pydantic.BaseModel --input swagger.yaml --output consoleme/models.py
 ```
 
 ## How do I debug the unit tests?
@@ -70,9 +70,9 @@ If an updated package causes an incompatibility issue, please identify the issue
 
 ## How can I run and debug my local DynamoDB container?
 
-Running `docker-compose -f docker-compose-dependencies.yaml up` in the root directory will enable local dynamodb and local redis.
+Running `docker-compose -f docker-compose-dependencies.yaml up` in the root directory will enable local dynamodb and local Redis.
 
-To install a web interface to assist with managing local dynamodb, install dynamodb-admin with the following command, then just visit [http://localhost:8001](http://localhost:8001) to view the contents of your local DynamoDB.
+To install a web interface to assist with managing local dynamodb, install dynamodb-admin with the following command, then visit [http://localhost:8001](http://localhost:8001) to view the contents of your local DynamoDB.
 
 ```bash
 npm install dynamodb-admin -g

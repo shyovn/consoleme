@@ -10,11 +10,11 @@ To configure this option, the following configuration values should be set in yo
 
 ```text
 cache_accounts_from_aws_organizations:
-  # This is the account ID of your AWS organizations master
-  organizations_master_account_id: "123456789012"
-  # This is the name of the role that consoleme will attempt to assume on
-  # your Organizations master account to call organizations:listaccounts.
-  organizations_master_role_to_assume: "ConsoleMe"
+  # This is a list of the account IDs of your AWS organizations master(s)
+  - organizations_master_account_id: "123456789012"
+    # This is the name of the role that consoleme will attempt to assume on
+    # your Organizations master account to call organizations:listaccounts.
+    organizations_master_role_to_assume: "ConsoleMe"
 ```
 
 ## **Sync Accounts from** SWAG
@@ -33,7 +33,7 @@ retrieve_accounts_from_swag:
 
 ## **Sync Accounts from** Configuration
 
-You can also optionally provide configuration that explicitly provides ConsoleMe with a mapping of your account IDs to account names. You can provide this list either in your local configuration, or \(as an administrator\) your dynamic configuration at [https://your\_consoleme\_url/config](https://your_consoleme_url/config) .
+You can also optionally provide configuration that explicitly provides ConsoleMe with a mapping of your account IDs to account names. You can provide this list either in your local configuration, or \(as an administrator\) your dynamic configuration at [https://your\_consoleme\_url/config](https://your_consoleme_url/config).
 
 > Account IDs should be quoted in YAML so that they are interpreted as strings. Account IDs can start with the number 0, and the first number would be dropped if interpreted as an integer.
 
